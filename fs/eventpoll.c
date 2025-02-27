@@ -39,7 +39,7 @@
 #include <linux/rculist.h>
 #include <linux/capability.h>
 #include <net/busy_poll.h>
-
+#include <linux/tsc_logger.h>
 /*
  * LOCKING:
  * There are three level of locking required by epoll :
@@ -98,6 +98,8 @@
 #define EP_UNACTIVE_PTR ((void *) -1L)
 
 #define EP_ITEM_COST (sizeof(struct epitem) + sizeof(struct eppoll_entry))
+
+extern struct TscLog *ukl_tsc_log;
 
 struct epoll_filefd {
 	struct file *file;
@@ -2264,6 +2266,7 @@ int do_epoll_ctl(int epfd, int op, int fd, struct epoll_event *epds,
 	if (!fd_file(f))
 		goto error_return;
 
+	tsclog_1(ukl_tsc_log, 1);
 	/* Get the "struct file *" for the target file */
 	tf = fdget(fd);
 	if (!fd_file(tf))
