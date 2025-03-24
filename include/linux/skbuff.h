@@ -713,6 +713,10 @@ enum skb_tstamp_type {
 	__SKB_CLOCK_MAX = SKB_CLOCK_TAI,
 };
 
+struct log_info {
+	__u8 log_mark:1;
+	__u16 log_id;
+};
 /**
  * DOC: Basic sk_buff geometry
  *
@@ -1068,6 +1072,8 @@ struct sk_buff {
 #endif
 
 	); /* end headers group */
+
+	struct log_info		log;
 
 	/* These elements must be at the end, see alloc_skb() for details.  */
 	sk_buff_data_t		tail;
