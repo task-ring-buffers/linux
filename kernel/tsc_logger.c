@@ -19,7 +19,7 @@ EXPORT_SYMBOL_GPL(ukl_tsc_log);
 static int max_event_count = 1000000;
 module_param(max_event_count, int, 0);
 
-static int vals_per_entry = 1;
+static int vals_per_entry = 2;
 module_param(vals_per_entry, int, 0);
 
 extern unsigned int __read_mostly tsc_khz;
@@ -37,7 +37,7 @@ static int logger_show(struct seq_file *m, void *v)
 	}
 	seq_printf(m, "\n");
 
-	while (e != cur) {
+	while (e < cur) {
 		seq_printf(m, "%u\t%u\t%llu", e->cpu, e->tid, e->tsc);
 		for (int i = 0; i < vals_per_entry; i++) {
 			seq_printf(m, "\t%llu", e->values[i]);
