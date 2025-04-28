@@ -247,7 +247,7 @@ int ip_local_deliver(struct sk_buff *skb)
 	struct net *net = dev_net(skb->dev);
 
 	if (ip_is_fragment(ip_hdr(skb))) {
-		if (ip_defrag(net, skb, IP_DEFRAG_LOCAL_DELIVER))
+		if (ip_defrag(net, skb, IP_DEFRAG_LOCAL_DELIVER)) 
 			return 0;
 	}
 

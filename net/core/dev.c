@@ -159,11 +159,13 @@
 #include <net/page_pool/helpers.h>
 #include <net/rps.h>
 #include <linux/phy_link_topology.h>
+#include <linux/tsc_logger.h>
 
 #include "dev.h"
 #include "devmem.h"
 #include "net-sysfs.h"
 
+extern struct TscLog *ukl_tsc_log;
 static DEFINE_SPINLOCK(ptype_lock);
 struct list_head ptype_base[PTYPE_HASH_SIZE] __read_mostly;
 
@@ -5464,6 +5466,8 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
 	bool deliver_exact = false;
 	int ret = NET_RX_DROP;
 	__be16 type;
+	struct log_info *lg;
+	int log;
 
 	net_timestamp_check(!READ_ONCE(net_hotdata.tstamp_prequeue), skb);
 
@@ -5475,8 +5479,12 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
 	if (!skb_transport_header_was_set(skb))
 		skb_reset_transport_header(skb);
 	skb_reset_mac_len(skb);
-
+	
 	pt_prev = NULL;
+
+	lg = &(skb->log);
+	if (lg->log_mark)
+		tsclog_2(ukl_tsc_log, lg->log_id, 200);
 
 another_round:
 	skb->skb_iif = skb->dev->ifindex;
