@@ -59,6 +59,52 @@
 #include "en/params.h"
 #include "devlink.h"
 #include "en/devlink.h"
+#include <linux/tsc_logger.h>
+#include <linux/if_ether.h>
+#include <linux/netdevice.h>
+#include <linux/printk/h>
+#include <linux/highmem.h>
+
+uint64_t log_id = 1;
+extern struct TscLog *ukl_tsc_log;
+
+int tsclog_port_check(struct page *page, u32 offset, int proto, u32 port)
+{
+	void *packet_data = page_address(page) + offset;
+	struct ethhdr *eth = (struct ethhdr *) packet_data;
+	struct iphdr *ip;
+	struct udphdr *udp;
+	struct tcphdr *tcp;
+	u16 dport;
+	if(eth->h_proto == htons(ETH_P_IP)) {
+		ip = (struct iphdr *) (eth + 1);
+		if (ip->protocol == proto){
+			if (proto == IPPROTO_UDP) {
+				udp = (struct udphdr *) ((char *)ip + (ip->ihl *4));
+				dport = ntohs(udp->dest);
+				if (dport == port)
+					return 1;
+				else
+					return 0;
+			}
+			else if (proto == IPPROTO_TCP) {
+				tcp = (struct tcphdr *) ((char *)ip + (ip->ihl *4));
+                                dport = ntohs(tcp->dest);
+                                if (dport == port)
+                                        return 1;
+                                else
+                                        return 0;
+
+			}
+		}
+		else {
+			return 0;
+		}
+
+	}
+	return 0;
+
+}
 
 static struct sk_buff *
 mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
@@ -1674,6 +1720,8 @@ mlx5e_skb_from_cqe_linear(struct mlx5e_rq *rq, struct mlx5e_wqe_frag_info *wi,
 	void *va, *data;
 	dma_addr_t addr;
 	u32 frag_size;
+	struct log_info *lg;
+	int log;
 
 	va             = page_address(frag_page->page) + wi->offset;
 	data           = va + rx_headroom;
@@ -1699,10 +1747,18 @@ mlx5e_skb_from_cqe_linear(struct mlx5e_rq *rq, struct mlx5e_wqe_frag_info *wi,
 		cqe_bcnt = mxbuf.xdp.data_end - mxbuf.xdp.data;
 	}
 	frag_size = MLX5_SKB_FRAG_SZ(rx_headroom + cqe_bcnt);
+
+	log = tsclog_port_check(frag_page->page, wi->offset, IPROTO_UDP, 8080);
 	skb = mlx5e_build_linear_skb(rq, va, frag_size, rx_headroom, cqe_bcnt, metasize);
 	if (unlikely(!skb))
 		return NULL;
-
+	
+	lg = &(skb->log);
+	if (log) {
+		lg->log_mark = 1;
+		lg->log_id = log_id++;
+		tsclog_2(ukl_tsc_log, lg->log_id, 200);
+	}
 	/* queue up for recycling/reuse */
 	skb_mark_for_recycle(skb);
 	frag_page->frags++;

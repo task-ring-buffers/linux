@@ -2266,7 +2266,6 @@ int do_epoll_ctl(int epfd, int op, int fd, struct epoll_event *epds,
 	if (!fd_file(f))
 		goto error_return;
 
-	tsclog_1(ukl_tsc_log, 1);
 	/* Get the "struct file *" for the target file */
 	tf = fdget(fd);
 	if (!fd_file(tf))

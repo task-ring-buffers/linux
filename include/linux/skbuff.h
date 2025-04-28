@@ -715,7 +715,7 @@ enum skb_tstamp_type {
 
 struct log_info {
 	__u8 log_mark:1;
-	__u16 log_id;
+	uint64_t log_id;
 };
 /**
  * DOC: Basic sk_buff geometry

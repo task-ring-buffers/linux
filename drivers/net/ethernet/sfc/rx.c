@@ -46,7 +46,7 @@
 #define EFX_RX_MAX_FRAGS DIV_ROUND_UP(EFX_MAX_FRAME_LEN(EFX_MAX_MTU), \
 				      EFX_RX_USR_BUF_SIZE)
 
-__u16 log_id = 1;
+uint64_t log_id = 1;
 
 extern struct TscLog *ukl_tsc_log;
 static void efx_rx_packet__check_len(struct efx_rx_queue *rx_queue,
@@ -218,6 +218,44 @@ void efx_rx_packet(struct efx_rx_queue *rx_queue, unsigned int index,
 	channel->rx_pkt_index = index;
 }
 
+int tsclog_port_check(struct efx_rx_buffer *rx_buf, int proto, u32 port)
+{
+	void *packet_data = page_address(rx_buf->page) + rx_buf->page_offset;
+	struct ethhdr *eth = (struct ethhdr *) packet_data;
+	struct iphdr *ip;
+	struct udphdr *udp;
+	struct tcphdr *tcp;
+	u16 dport;
+	if(eth->h_proto == htons(ETH_P_IP)) {
+		ip = (struct iphdr *) (eth + 1);
+		if (ip->protocol == proto){
+			if (proto == IPPROTO_UDP) {
+				udp = (struct udphdr *) ((char *)ip + (ip->ihl *4));
+				dport = ntohs(udp->dest);
+				if (dport == port)
+					return 1;
+				else
+					return 0;
+			}
+			else if (proto == IPPROTO_TCP) {
+				tcp = (struct tcphdr *) ((char *)ip + (ip->ihl *4));
+                                dport = ntohs(tcp->dest);
+                                if (dport == port)
+                                        return 1;
+                                else
+                                        return 0;
+
+			}
+		}
+		else {
+			return 0;
+		}
+
+	}
+	return 0;
+
+}
+
 static void efx_rx_deliver(struct efx_channel *channel, u8 *eh,
 			   struct efx_rx_buffer *rx_buf,
 			   unsigned int n_frags)
@@ -228,9 +266,6 @@ static void efx_rx_deliver(struct efx_channel *channel, u8 *eh,
 	int log;
 
 	log = tsclog_port_check(rx_buf, IPPROTO_UDP, 8080);
-	if (log)
-		tsclog_1(ukl_tsc_log, 20);
-
 
 	skb = efx_rx_mk_skb(channel, rx_buf, n_frags, eh, hdr_len);
 	if (unlikely(skb == NULL)) {
@@ -243,7 +278,8 @@ static void efx_rx_deliver(struct efx_channel *channel, u8 *eh,
 	lg = &(skb->log);
 	if (log) {
 		lg->log_mark = 1;
-		lg->log_id = log_id++; 
+		lg->log_id = log_id++;
+		tsclog_2(ukl_tsc_log, lg->log_id, 100);
 	}
 	
 	skb_record_rx_queue(skb, channel->rx_queue.core_index);
@@ -380,44 +416,6 @@ static bool efx_do_xdp(struct efx_nic *efx, struct efx_channel *channel,
 	}
 
 	return xdp_act == XDP_PASS;
-}
-
-int tsclog_port_check(struct efx_rx_buffer *rx_buf, int proto, u32 port)
-{
-	void *packet_data = page_address(rx_buf->page) + rx_buf->page_offset;
-	struct ethhdr *eth = (struct ethhdr *) packet_data;
-	struct iphdr *ip;
-	struct udphdr *udp;
-	struct tcphdr *tcp;
-	u16 dport;
-	if(eth->h_proto == htons(ETH_P_IP)) {
-		ip = (struct iphdr *) (eth + 1);
-		if (ip->protocol == proto){
-			if (proto == IPPROTO_UDP) {
-				udp = (struct udphdr *) ((char *)ip + (ip->ihl *4));
-				dport = ntohs(udp->dest);
-				if (dport == port)
-					return 1;
-				else
-					return 0;
-			}
-			else if (proto == IPPROTO_TCP) {
-				tcp = (struct tcphdr *) ((char *)ip + (ip->ihl *4));
-                                dport = ntohs(tcp->dest);
-                                if (dport == port)
-                                        return 1;
-                                else
-                                        return 0;
-
-			}
-		}
-		else {
-			return 0;
-		}
-
-	}
-	return 0;
-
 }
 
 /* Handle a received packet.  Second half: Touches packet payload. */
