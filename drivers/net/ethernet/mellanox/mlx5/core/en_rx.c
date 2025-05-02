@@ -62,13 +62,13 @@
 #include <linux/tsc_logger.h>
 #include <linux/if_ether.h>
 #include <linux/netdevice.h>
-#include <linux/printk/h>
+#include <linux/printk.h>
 #include <linux/highmem.h>
 
-uint64_t log_id = 1;
+uint64_t log_id_exp1 = 1;
 extern struct TscLog *ukl_tsc_log;
 
-int tsclog_port_check(struct page *page, u32 offset, int proto, u32 port)
+int mlx_tsclog_port_check(struct page *page, u32 offset, int proto, u32 port)
 {
 	void *packet_data = page_address(page) + offset;
 	struct ethhdr *eth = (struct ethhdr *) packet_data;
@@ -1748,7 +1748,7 @@ mlx5e_skb_from_cqe_linear(struct mlx5e_rq *rq, struct mlx5e_wqe_frag_info *wi,
 	}
 	frag_size = MLX5_SKB_FRAG_SZ(rx_headroom + cqe_bcnt);
 
-	log = tsclog_port_check(frag_page->page, wi->offset, IPROTO_UDP, 8080);
+	log = mlx_tsclog_port_check(frag_page->page, wi->offset, IPPROTO_UDP, 8080);
 	skb = mlx5e_build_linear_skb(rq, va, frag_size, rx_headroom, cqe_bcnt, metasize);
 	if (unlikely(!skb))
 		return NULL;
@@ -1756,7 +1756,7 @@ mlx5e_skb_from_cqe_linear(struct mlx5e_rq *rq, struct mlx5e_wqe_frag_info *wi,
 	lg = &(skb->log);
 	if (log) {
 		lg->log_mark = 1;
-		lg->log_id = log_id++;
+		lg->log_id = log_id_exp1++;
 		tsclog_2(ukl_tsc_log, lg->log_id, 200);
 	}
 	/* queue up for recycling/reuse */
