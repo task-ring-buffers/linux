@@ -2304,6 +2304,86 @@ static int set_pflag_tx_port_ts(struct net_device *netdev, bool enable)
 	return err;
 }
 
+static int set_pflag_custom_rq(struct net_device *netdev, bool enable)
+{
+	struct mlx5e_priv *priv = netdev_priv(netdev);
+	struct mlx5e_params *cur_params = &priv->channels.params;
+	struct mlx5e_params new_params;
+	bool arfs_enabled;
+	bool opened;
+	int err = 0;
+
+	// set channel param count to 2.
+	unsigned int count = 2;
+
+	if (!count) {
+		netdev_info(priv->netdev, "%s: combined_count=0 not supportef\n",
+				__func__);
+		return -EINVAL;
+	}
+
+	if (cur_params->num_channels == count)
+		return 0;
+
+	mutex_lock(&priv->state_lock);
+
+	// check if count already exists
+	// get the state lock
+	// check for xor 8 limitation (for future in case we specify a paramter to adjust the number of rqs)
+	
+	if (mlx5e_rx_res_get_current_hash(priv->rx_res).hfunc == ETH_RSS_HASH_XOR) {
+                unsigned int xor8_max_channels = mlx5e_rqt_max_num_channels_allowed_for_xor8();
+
+                if (count > xor8_max_channels) {
+                        err = -EINVAL;
+                        netdev_err(priv->netdev, "%s: Requested number of channels (%d) exceeds the maximum allowed by the XOR8 RSS hfunc (%d)\n",
+                                   __func__, count, xor8_max_channels);
+                        goto out;
+                }
+        }
+
+	if (mlx5e_selq_is_htb_enabled(&priv->selq)) {
+                err = -EINVAL;
+                netdev_err(priv->netdev, "%s: HTB offload is active, cannot change the number of channels\n",
+                           __func__);
+                goto out;
+        }
+
+ 	if (cur_params->mqprio.mode == TC_MQPRIO_MODE_CHANNEL) {
+                err = -EINVAL;
+                netdev_err(priv->netdev, "%s: MQPRIO mode channel offload is active, cannot change the number of channels\n",
+                           __func__);
+                goto out;
+        }
+
+	new_param = *cur_params;
+	new_params.num_channels = count;
+	MLX5E_SET_PFLAG(&new_params, MLX5E_PFLAG_CUSTOM_RQ, enable);
+
+	opened = test_bit(MLX5E_STATE_OPENED, &priv->state);
+
+        arfs_enabled = opened && mlx5e_fs_want_arfs(priv->netdev);
+        if (arfs_enabled)
+                mlx5e_arfs_disable(priv->fs);
+
+        /* Switch to new channels, set new parameters and close old ones */
+        err = mlx5e_safe_switch_params(priv, &new_params,
+                                       mlx5e_num_channels_changed_ctx, NULL, true);
+
+        if (arfs_enabled) {
+                int err2 = mlx5e_arfs_enable(priv->fs);
+
+                if (err2)
+                        netdev_err(priv->netdev, "%s: mlx5e_arfs_enable failed: %d\n",
+                                   __func__, err2);
+        }
+
+	out:
+        mutex_unlock(&priv->state_lock);
+
+        return err;
+}
+
 static const struct pflag_desc mlx5e_priv_flags[MLX5E_NUM_PFLAGS] = {
 	{ "rx_cqe_moder",        set_pflag_rx_cqe_based_moder },
 	{ "tx_cqe_moder",        set_pflag_tx_cqe_based_moder },
@@ -2313,6 +2393,7 @@ static const struct pflag_desc mlx5e_priv_flags[MLX5E_NUM_PFLAGS] = {
 	{ "xdp_tx_mpwqe",        set_pflag_xdp_tx_mpwqe },
 	{ "skb_tx_mpwqe",        set_pflag_skb_tx_mpwqe },
 	{ "tx_port_ts",          set_pflag_tx_port_ts },
+	{ "custom_rq", 		 set_pflag_custom_rq },
 };
 
 static int mlx5e_handle_pflag(struct net_device *netdev,

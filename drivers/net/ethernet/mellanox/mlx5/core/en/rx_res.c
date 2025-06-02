@@ -31,6 +31,13 @@ struct mlx5e_rx_res {
 		struct mlx5e_rqt rqt;
 		struct mlx5e_tir tir;
 	} ptp;
+	
+	struct {
+		struct mlx5e_rqt trb_rqt;
+		struct mlx5e_tir trb_tir;
+	} *trb_channel_res;
+
+
 };
 
 /* API for rx_res_rss_* */
