@@ -294,6 +294,7 @@ struct mlx5e_params {
 			u32 hw_id[TC_MAX_QUEUE];
 		} channel;
 	} mqprio;
+	bool trb_enabled;
 	bool rx_cqe_compress_def;
 	struct dim_cq_moder rx_cq_moderation;
 	struct dim_cq_moder tx_cq_moderation;

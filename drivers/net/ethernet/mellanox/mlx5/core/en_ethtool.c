@@ -2358,6 +2358,7 @@ static int set_pflag_custom_rq(struct net_device *netdev, bool enable)
 
 	new_param = *cur_params;
 	new_params.num_channels = count;
+	new_params.trb_enabled = 1;
 	MLX5E_SET_PFLAG(&new_params, MLX5E_PFLAG_CUSTOM_RQ, enable);
 
 	opened = test_bit(MLX5E_STATE_OPENED, &priv->state);

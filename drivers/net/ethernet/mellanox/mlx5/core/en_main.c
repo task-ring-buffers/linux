@@ -3248,7 +3248,7 @@ int mlx5e_trb_res_create(struct mlx5e_priv *priv, struct mlx5e_channels *chs)
 		mlx5e_tir_builder_build_packet_merge(builder, &res->pkt_merge_param);
                 mlx5e_tir_builder_build_direct(builder);
 
-		err = mlx5e_tir_init(&res->channels[ix].direct_tir, builder, res->mdev, true);
+		err = mlx5e_tir_init(&res->trb_channel_res[ix].trb_tir, builder, res->mdev, true);
 		if (err) {
 			pr_warn("Failed to create a direct TIR: err = %d, ix = %u\n", err, ix);
 			goto err_destroy_direct_tirs;
@@ -3263,7 +3263,7 @@ err_destroy_direct_tirs:
 while (--ix >= 0)
 	mlx5e_tir_destroy(&res->trb_channel_res[ix].trb_tir);
 
-        ix = res->nch;
+        ix = nch;
 err_destroy_direct_rqts:
 while (--ix >= 0)
 	mlx5e_rqt_destroy(&res->trb_channel_res[ix].trb_rqt);
@@ -3276,21 +3276,65 @@ out:
 
 }
 
+void destryoy_trb_res(struct mlx5e_priv, mlx5e_channels *chs)
+{
+	struct mlx5e_rx_res *res = priv->rx_res;
+        unsigned int nch = chs->params->num_channels;
+	int ix = nch;
+
+	while (--ix >= 0)
+        mlx5e_tir_destroy(&res->trb_channel_res[ix].trb_tir);
+
+	ix = nch;
+	while (--ix >= 0)
+        mlx5e_rqt_destroy(&res->trb_channel_res[ix].trb_rqt);
+
+        kvfree(res->trb_channel_rx);
+}
+
 int mlx5e_trb_ttc_cleanup(struct mlx5_ttc_table *ttc)
 {
 	mlx5_cleanup_ttc_rules(ttc);
 }
 
-void trb_deactivate_rx_res(struct mlx5e_rx_res *res)
+void trb_deactivate_rx_res(struct mlx5e_priv *priv)
 {
+	struct mlx5e_rx_res *res = priv->rx_res;
 	//disables rss
 	//deactivated direct tirs and rqts
 	mlx5e_rx_res_channels_deactivate(res);
 }
 
-int mlx5e_trb_create_flow_groups(struct mlx5e_priv *priv, struct mlx5_ttc_table *ttc)
+int mlx5e_trb_modify_flow_rules(struct mlx5e_priv *priv)
 {
-	return 0;
+	struct mlx5_flow_destination dest = {}
+	struct mlx5_ttc_table *ttc = priv->fs->ttc;
+	int tt;
+	int err = 0;
+	dest.type = MLX5_FLOW_DESTINATION_TYPE_TIR;
+	dest.tir_num = priv->rx_res->trb_channel_res[0].trb_tir.tirn;
+	
+	for (tt = 0; tt < MLX5_NUM_TT; tt++){
+		if (!IS_ERR_OR_NULL(ttc->rules[i].rule)) {
+			err = mlx5_ttc_fwd_dest(ttc, tt, &dest);
+			if (err){
+				pr_warn("Error setting ttc des for tt %d\n",tt);
+				goto reset_rules;
+			}
+		}
+	}
+
+	return err;
+
+reset_rules:
+	for (tt = 0; tt < MLX5_NUM_TT; tt++){
+	 	err = mlx5_ttc_fwd_default_dest(ttc, tt);
+		if (err)
+			return err;
+	}
+	return err;
+
+
 }
 static int mlx5e_switch_priv_params(struct mlx5e_priv *priv,
 				    struct mlx5e_params *new_params,
@@ -3340,7 +3384,7 @@ static int mlx5e_switch_priv_channels(struct mlx5e_priv *priv,
 		err = preactivate(priv, context);
 		if (err) {
 			priv->channels = old_chs;
-			goto out;
+			goto trb_activate;
 		}
 	}
 
@@ -3348,9 +3392,23 @@ static int mlx5e_switch_priv_channels(struct mlx5e_priv *priv,
 	priv->profile->update_rx(priv);
 
 	mlx5e_selq_apply(&priv->selq);
-out:
-	mlx5e_activate_priv_channels(priv);
 
+trb_activate:
+	mlx5e_activate_priv_channels(priv);
+	
+	if(!err && priv->channels.params.trb_enabled){
+		err = mlx5e_trb_res_create(priv, &priv->channels);
+		goto out;
+		//trb_deactivate_rx_res(priv);
+		mlx5e_rx_res_rss_disable(priv->rx_res);
+		err = mlx5e_trb_modify_flow_rules(priv);
+		if (err){
+			pr_warn("Cannot modify flow rules\n");
+			destryoy_trb_res(priv, &priv->channels);
+		}
+
+	}
+out:
 	/* return carrier back if needed */
 	if (carrier_ok)
 		netif_carrier_on(netdev);
@@ -3396,6 +3454,8 @@ err_cancel_selq:
 	kfree(new_chs);
 	return err;
 }
+
+
 
 int mlx5e_safe_reopen_channels(struct mlx5e_priv *priv)
 {
