@@ -398,6 +398,80 @@ out:
 	return err;
 }
 
+void mlx5e_trb_rss_disable(struct mlx5e_rx_res *res)
+{
+	mlx5e_rx_res_rss_disable(res);
+}
+
+void destroy_trb_res(struct mlx5e_rx_res *res, unsigned int nch)
+{
+	int ix = nch;
+
+        while (--ix >= 0)
+		mlx5e_tir_destroy(&res->trb_channel_res[ix].trb_tir);
+
+        ix = nch;
+	while (--ix >= 0)
+		mlx5e_rqt_destroy(&res->trb_channel_res[ix].trb_rqt);
+
+        kvfree(res->trb_channel_res);
+}
+
+int mlx5e_trb_res_create(struct mlx5e_rx_res *res, unsigned  int nch)
+{
+        struct mlx5e_tir_builder *builder;
+        int err = 0;
+        int ix;
+
+        builder = mlx5e_tir_builder_alloc(false);
+        if (!builder)
+                return -ENOMEM;
+        res->trb_channel_res = kvcalloc(nch, sizeof(*res->trb_channel_res), GFP_KERNEL);
+
+        if (!res->trb_channel_res) {
+                err = -ENOMEM;
+                goto out;
+        }
+
+        for (ix = 0; ix < nch; ix++) {
+                err = mlx5e_rqt_init_direct(&res->trb_channel_res[ix].trb_rqt, res->mdev, false, res->rss_rqns[ix], 1);
+		//pr_warn("RQ no %d is %u\n", ix, res->rss_rqns[ix]);
+                if (err) {
+                        pr_warn("Failed to create RQT\n");
+                        goto err_destroy_direct_rqts;
+                }
+        }
+
+        for (ix = 0; ix < nch; ix++) {
+                mlx5e_tir_builder_build_rqt(builder, res->mdev->mlx5e_res.hw_objs.td.tdn, mlx5e_rqt_get_rqtn(&res->trb_channel_res[ix].trb_rqt), false);
+                mlx5e_tir_builder_build_packet_merge(builder, &res->pkt_merge_param);
+                mlx5e_tir_builder_build_direct(builder);
+
+                err = mlx5e_tir_init(&res->trb_channel_res[ix].trb_tir, builder, res->mdev, true);
+                if (err) {
+                        pr_warn("Failed to create a direct TIR: err = %d, ix = %u\n", err, ix);
+                        goto err_destroy_direct_tirs;
+                }
+
+                mlx5e_tir_builder_clear(builder);
+        }
+
+        goto out;
+
+err_destroy_direct_tirs:
+	while (--ix >= 0)
+		mlx5e_tir_destroy(&res->trb_channel_res[ix].trb_tir);
+
+        ix = nch;
+err_destroy_direct_rqts:
+	while (--ix >= 0)
+		mlx5e_rqt_destroy(&res->trb_channel_res[ix].trb_rqt);
+	kvfree(res->trb_channel_res);
+out:
+        mlx5e_tir_builder_free(builder);
+	return err;
+}
+
 static int mlx5e_rx_res_ptp_init(struct mlx5e_rx_res *res)
 {
 	bool inner_ft_support = res->features & MLX5E_RX_RES_FEATURE_INNER_FT;
@@ -507,6 +581,11 @@ void mlx5e_rx_res_destroy(struct mlx5e_rx_res *res)
 u32 mlx5e_rx_res_get_tirn_direct(struct mlx5e_rx_res *res, unsigned int ix)
 {
 	return mlx5e_tir_get_tirn(&res->channels[ix].direct_tir);
+}
+
+u32 mlx5e_rx_res_get_trb_tirn(struct mlx5e_rx_res *res, unsigned int ix)
+{
+	return mlx5e_tir_get_tirn(&res->trb_channel_res[ix].trb_tir);
 }
 
 u32 mlx5e_rx_res_get_tirn_rss(struct mlx5e_rx_res *res, enum mlx5_traffic_types tt)

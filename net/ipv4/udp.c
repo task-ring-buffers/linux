@@ -2440,7 +2440,6 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 	if (udp4_csum_init(skb, uh, proto))
 		goto csum_error;
 	
-	printk("log point 300");
 	if (lg->log_mark)
 		tsclog_2(ukl_tsc_log, lg->log_id, 300);
 

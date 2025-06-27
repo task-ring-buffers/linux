@@ -74,6 +74,8 @@
 #include "en/trap.h"
 #include "lib/devcom.h"
 #include "lib/sd.h"
+#include "en/rx_res.h"
+#include "en_trb.h"
 
 static bool mlx5e_hw_gro_supported(struct mlx5_core_dev *mdev)
 {
@@ -3216,87 +3218,7 @@ void mlx5e_deactivate_priv_channels(struct mlx5e_priv *priv)
 	mlx5e_deactivate_channels(&priv->channels);
 }
 
-int mlx5e_trb_res_create(struct mlx5e_priv *priv, struct mlx5e_channels *chs)
-{
-	struct mlx5e_rx_res *res = priv->rx_res;
-	unsigned int nch = chs->params->num_channels;
-	struct mlx5e_tir_builder *builder;
-	int err = 0;
-	int ix;
-
-	builder = mlx5e_tir_builer_alloc(false);
-	if (!builder)
-		return -ENOMEM;
-	res->trb_channel_res = kvcalloc(nch, sizeof(*res->trb_channel_res), GFP_KERNEL);
-
-	if (!res->trb_channel_res) {
-		err = -ENOMEM;
-		goto out;
-	}
-
-	for (ix = 0; ix < nch; ix++) {
-		err = mlx5e_rqt_init_direct(&res->trb_channel_res[ix].trb_rqt, res->mdev, false, chs->c[ix]->rq.rqn, 1);
-
-		if (err) {
-			pr_warn("Failed to create RQT\n");
-			goto err_destroy_direct_rqts;
-		}
-	}
-
-	for (ix = 0; ix < nch; ix++) {
-		mlx5e_tir_builder_build_rqt(builder, res->mdev->mlx5e_res.hw_objs.td.tdn, mlx5e_rqt_get_rqtn(&res->trb_channel_res[ix].trb_rqt), false);
-		mlx5e_tir_builder_build_packet_merge(builder, &res->pkt_merge_param);
-                mlx5e_tir_builder_build_direct(builder);
-
-		err = mlx5e_tir_init(&res->trb_channel_res[ix].trb_tir, builder, res->mdev, true);
-		if (err) {
-			pr_warn("Failed to create a direct TIR: err = %d, ix = %u\n", err, ix);
-			goto err_destroy_direct_tirs;
-		}
-
-		mlx5e_tir_builder_clear(builder);
-	}
-
-	goto out;
-
-err_destroy_direct_tirs:
-while (--ix >= 0)
-	mlx5e_tir_destroy(&res->trb_channel_res[ix].trb_tir);
-
-        ix = nch;
-err_destroy_direct_rqts:
-while (--ix >= 0)
-	mlx5e_rqt_destroy(&res->trb_channel_res[ix].trb_rqt);
-
-        kvfree(res->trb_channel_rx);
-out:
-	mlx5e_tir_builder_free(builder);
-
-	return err;
-
-}
-
-void destryoy_trb_res(struct mlx5e_priv, mlx5e_channels *chs)
-{
-	struct mlx5e_rx_res *res = priv->rx_res;
-        unsigned int nch = chs->params->num_channels;
-	int ix = nch;
-
-	while (--ix >= 0)
-        mlx5e_tir_destroy(&res->trb_channel_res[ix].trb_tir);
-
-	ix = nch;
-	while (--ix >= 0)
-        mlx5e_rqt_destroy(&res->trb_channel_res[ix].trb_rqt);
-
-        kvfree(res->trb_channel_rx);
-}
-
-int mlx5e_trb_ttc_cleanup(struct mlx5_ttc_table *ttc)
-{
-	mlx5_cleanup_ttc_rules(ttc);
-}
-
+/*
 void trb_deactivate_rx_res(struct mlx5e_priv *priv)
 {
 	struct mlx5e_rx_res *res = priv->rx_res;
@@ -3305,37 +3227,8 @@ void trb_deactivate_rx_res(struct mlx5e_priv *priv)
 	mlx5e_rx_res_channels_deactivate(res);
 }
 
-int mlx5e_trb_modify_flow_rules(struct mlx5e_priv *priv)
-{
-	struct mlx5_flow_destination dest = {}
-	struct mlx5_ttc_table *ttc = priv->fs->ttc;
-	int tt;
-	int err = 0;
-	dest.type = MLX5_FLOW_DESTINATION_TYPE_TIR;
-	dest.tir_num = priv->rx_res->trb_channel_res[0].trb_tir.tirn;
-	
-	for (tt = 0; tt < MLX5_NUM_TT; tt++){
-		if (!IS_ERR_OR_NULL(ttc->rules[i].rule)) {
-			err = mlx5_ttc_fwd_dest(ttc, tt, &dest);
-			if (err){
-				pr_warn("Error setting ttc des for tt %d\n",tt);
-				goto reset_rules;
-			}
-		}
-	}
+*/
 
-	return err;
-
-reset_rules:
-	for (tt = 0; tt < MLX5_NUM_TT; tt++){
-	 	err = mlx5_ttc_fwd_default_dest(ttc, tt);
-		if (err)
-			return err;
-	}
-	return err;
-
-
-}
 static int mlx5e_switch_priv_params(struct mlx5e_priv *priv,
 				    struct mlx5e_params *new_params,
 				    mlx5e_fp_preactivate preactivate,
@@ -3366,6 +3259,7 @@ static int mlx5e_switch_priv_channels(struct mlx5e_priv *priv,
 {
 	struct net_device *netdev = priv->netdev;
 	struct mlx5e_channels old_chs;
+	struct trb_params params;
 	int carrier_ok;
 	int err = 0;
 
@@ -3397,17 +3291,44 @@ trb_activate:
 	mlx5e_activate_priv_channels(priv);
 	
 	if(!err && priv->channels.params.trb_enabled){
-		err = mlx5e_trb_res_create(priv, &priv->channels);
-		goto out;
-		//trb_deactivate_rx_res(priv);
-		mlx5e_rx_res_rss_disable(priv->rx_res);
-		err = mlx5e_trb_modify_flow_rules(priv);
-		if (err){
-			pr_warn("Cannot modify flow rules\n");
-			destryoy_trb_res(priv, &priv->channels);
+		pr_warn("TRB_ENABLED detected\n");
+		err = mlx5e_trb_res_create(priv->rx_res, priv->channels.params.num_channels);
+		if (err) {
+			pr_warn("Failed to create trb resources\n");
+			//priv->channels = old_chs;
+			goto out;
 		}
-
+		mlx5e_rx_res_channels_deactivate(priv->rx_res);
+		//mlx5e_trb_rss_disable(priv->rx_res);
+		err = mlx5e_trb_modify_flow_rules(priv->fs, priv->rx_res);
+		if (err) {
+			pr_warn("Cannot modify ttc flow rules\n");
+			//priv->channels = old_chs
+			goto err_destroy_trb;
+		}
+		params.type = TRB_FS_IPV4_UDP;
+		params.dport = 8080;
+		err = mlx5e_create_trb_table(priv->fs, priv->rx_res, &params);
+		if (err) {
+			pr_warn("trb flow table set up failed\n");
+			//priv->channels = old_chs
+			goto err_reset_ttc_rules;
+		}
 	}
+	/*for future (1) to return to the old chs
+	 * mlx5e_activate_priv_channels(priv); -- remove this line from above
+	 * if (!err)
+	 * 	mlx5e_rx_res_channels_deactivate(priv->rx_res); -- remove this line from above
+	 */
+	goto out;
+
+err_reset_ttc_rules:
+	trb_reset_ttc_rules(priv->fs);
+err_destroy_trb:
+	/* enable_rx_resource */
+	mlx5e_rx_res_channels_activate(priv->rx_res, new_chs);
+	destroy_trb_res(priv->rx_res, priv->channels.params.num_channels);
+	//mlx5e_activate_priv_channels(priv); -- for future (1)
 out:
 	/* return carrier back if needed */
 	if (carrier_ok)

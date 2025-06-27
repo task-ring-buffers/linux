@@ -37,6 +37,11 @@ struct mlx5_ttc_table {
 	struct mlx5_flow_handle *tunnel_rules[MLX5_NUM_TUNNEL_TT];
 };
 
+struct mlx5_flow_handle *get_ttc_rule(struct mlx5_ttc_table *ttc, int tt)
+{
+	return ttc->rules[tt].rule;
+}
+
 struct mlx5_flow_table *mlx5_get_ttc_flow_table(struct mlx5_ttc_table *ttc)
 {
 	return ttc->t;

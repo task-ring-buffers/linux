@@ -124,6 +124,12 @@ struct mlx5e_fs_udp;
 struct mlx5e_fs_any;
 struct mlx5e_ptp_fs;
 
+/* TRB API */
+int mlx5e_trb_modify_flow_rules(struct mlx5e_flow_steering *fs, struct mlx5e_rx_res *res);
+struct mlx5e_trb_table *mlx5e_fs_get_trb(struct mlx5e_flow_steering *fs);
+void mlx5e_fs_set_trb(struct mlx5e_flow_steering *fs, struct mlx5e_trb_table *trb);
+int trb_reset_ttc_rules(struct mlx5e_flow_steering *fs);
+
 void mlx5e_set_ttc_params(struct mlx5e_flow_steering *fs,
 			  struct mlx5e_rx_res *rx_res,
 			  struct ttc_params *ttc_params, bool tunnel);

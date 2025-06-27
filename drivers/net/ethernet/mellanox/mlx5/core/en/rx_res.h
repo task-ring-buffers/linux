@@ -62,6 +62,12 @@ int mlx5e_rx_res_rss_index(struct mlx5e_rx_res *res, struct mlx5e_rss *rss);
 struct mlx5e_rss *mlx5e_rx_res_rss_get(struct mlx5e_rx_res *res, u32 rss_idx);
 void mlx5e_rx_res_rss_update_num_channels(struct mlx5e_rx_res *res, u32 nch);
 
+/* TRB API*/
+int mlx5e_trb_res_create(struct mlx5e_rx_res *res, unsigned int nch);
+void destroy_trb_res(struct mlx5e_rx_res *res, unsigned int nch);
+u32 mlx5e_rx_res_get_trb_tirn(struct mlx5e_rx_res *res, unsigned int ix);
+void mlx5e_trb_rss_disable(struct mlx5e_rx_res *res);
+
 /* Workaround for hairpin */
 struct mlx5e_rss_params_hash mlx5e_rx_res_get_current_hash(struct mlx5e_rx_res *res);
 

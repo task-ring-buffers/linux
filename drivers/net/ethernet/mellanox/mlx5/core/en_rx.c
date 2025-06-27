@@ -2184,8 +2184,7 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 	u32 frag_size;
 	struct log_info *lg;
 	int log;
-	
-	printk("MLNX DETECED HERE 8");
+
 	/* Check packet size. Note LRO doesn't use linear SKB */
 	if (unlikely(cqe_bcnt > rq->hw_mtu)) {
 		rq->stats->oversize_pkts_sw_drop++;
@@ -2226,7 +2225,7 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 
 	lg = &(skb->log);
 	if (log) {
-		printk("log 200 found");
+		printk("log 200 found and rqn is %u", rq->rqn);
 		lg->log_mark = 1;
 		lg->log_id = log_id_exp1++;
 		tsclog_2(ukl_tsc_log, lg->log_id, 100);

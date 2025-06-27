@@ -2325,7 +2325,7 @@ static int set_pflag_custom_rq(struct net_device *netdev, bool enable)
 	if (cur_params->num_channels == count)
 		return 0;
 
-	mutex_lock(&priv->state_lock);
+	//mutex_lock(&priv->state_lock);
 
 	// check if count already exists
 	// get the state lock
@@ -2356,7 +2356,7 @@ static int set_pflag_custom_rq(struct net_device *netdev, bool enable)
                 goto out;
         }
 
-	new_param = *cur_params;
+	new_params = *cur_params;
 	new_params.num_channels = count;
 	new_params.trb_enabled = 1;
 	MLX5E_SET_PFLAG(&new_params, MLX5E_PFLAG_CUSTOM_RQ, enable);
@@ -2380,7 +2380,7 @@ static int set_pflag_custom_rq(struct net_device *netdev, bool enable)
         }
 
 	out:
-        mutex_unlock(&priv->state_lock);
+        //mutex_unlock(&priv->state_lock);
 
         return err;
 }

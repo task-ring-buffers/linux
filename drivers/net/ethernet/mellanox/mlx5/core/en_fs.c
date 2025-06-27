@@ -59,6 +59,7 @@ struct mlx5e_flow_steering {
 	struct mlx5e_l2_table           l2;
 	struct mlx5_ttc_table           *ttc;
 	struct mlx5_ttc_table           *inner_ttc;
+	struct mlx5e_trb_table 		*trb;
 #ifdef CONFIG_MLX5_EN_ARFS
 	struct mlx5e_arfs_tables       *arfs;
 #endif
@@ -101,6 +102,63 @@ struct mlx5e_l2_hash_node {
 	bool   mpfs;
 };
 
+int trb_reset_ttc_rules(struct mlx5e_flow_steering *fs)
+{
+	struct mlx5_ttc_table *ttc = fs->ttc;
+        int tt;
+        int err = 0;
+
+	for (tt = 0; tt < MLX5_NUM_TT; tt++){
+                err = mlx5_ttc_fwd_default_dest(ttc, tt);
+                if (err)
+                        return err;
+        }
+	return err;
+
+}
+
+int mlx5e_trb_modify_flow_rules(struct mlx5e_flow_steering *fs, struct mlx5e_rx_res *res)
+{
+	struct mlx5_flow_destination dest = {};
+	struct mlx5_ttc_table *ttc = fs->ttc;
+	int tt;
+	int err = 0;
+        dest.type = MLX5_FLOW_DESTINATION_TYPE_TIR;
+        dest.tir_num = mlx5e_rx_res_get_trb_tirn(res, 0);
+
+        for (tt = 0; tt < MLX5_NUM_TT; tt++){
+		if (!IS_ERR_OR_NULL(get_ttc_rule(ttc, tt))) {
+			err = mlx5_ttc_fwd_dest(ttc, tt, &dest);
+                        if (err) {
+				pr_warn("Error setting ttc des for tt %d\n",tt);
+				goto reset_rules;
+                        }
+			//pr_warn("Successfully set dest %p for tt type %d to 0\n", &dest, tt);
+                }
+        }
+
+        return err;
+
+reset_rules:
+        for (tt = 0; tt < MLX5_NUM_TT; tt++){
+                err = mlx5_ttc_fwd_default_dest(ttc, tt);
+                if (err)
+                        return err;
+        }
+        return err;
+
+
+}
+
+struct mlx5e_trb_table *mlx5e_fs_get_trb(struct mlx5e_flow_steering *fs)
+{
+	return fs->trb;
+}
+
+void mlx5e_fs_set_trb(struct mlx5e_flow_steering *fs, struct mlx5e_trb_table *trb)
+{
+	fs->trb = trb;
+}
 static inline int mlx5e_hash_l2(const u8 *addr)
 {
 	return addr[5];
