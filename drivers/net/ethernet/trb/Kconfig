@@ -1,0 +1,8 @@
+config TRB_RX_RING_DEV
+    bool "TRB RX Ring mmap device"
+    default n
+    help
+      Enables support for a memory-mapped RX ring device for experimentation
+      with zero-copy packet processing using user-space.
+
+
