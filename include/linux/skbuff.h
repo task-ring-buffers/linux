@@ -944,6 +944,9 @@ struct sk_buff {
 				head_frag:1,
 				pfmemalloc:1,
 				pp_recycle:1; /* page_pool recycle indicator */
+#ifdef CONFIG_TRB_RX_RING_DEV
+	__u8			trb_pkt;
+#endif
 #ifdef CONFIG_SKB_EXTENSIONS
 	__u8			active_extensions;
 #endif

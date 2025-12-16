@@ -42,6 +42,7 @@
 #include <net/udp.h>
 #include <net/tcp.h>
 #include <net/xdp_sock_drv.h>
+#include <net/trb.h>
 #include "en.h"
 #include "en/txrx.h"
 #include "en_tc.h"
@@ -324,7 +325,10 @@ static int mlx5e_page_alloc_fragmented(struct mlx5e_rq *rq,
 {
 	struct page *page;
 
-	page = page_pool_dev_alloc_pages(rq->page_pool);
+	if (rq->priv->channels.params.trb_enabled)
+		page = trb_page_pool_alloc(rq->page_pool);
+	else
+		page = page_pool_dev_alloc_pages(rq->page_pool);
 	if (unlikely(!page))
 		return -ENOMEM;
 
@@ -1675,6 +1679,9 @@ static inline void mlx5e_complete_rx_cqe(struct mlx5e_rq *rq,
 	stats->packets++;
 	stats->bytes += cqe_bcnt;
 	mlx5e_build_rx_skb(cqe, cqe_bcnt, rq, skb);
+#ifdef CONFIG_TRB_RX_RING_DEV
+	skb->trb_pkt = rq->priv->channels.params.trb_enabled;
+#endif
 }
 
 static inline

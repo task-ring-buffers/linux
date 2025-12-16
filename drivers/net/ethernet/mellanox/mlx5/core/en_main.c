@@ -76,6 +76,7 @@
 #include "lib/sd.h"
 #include "en/rx_res.h"
 #include "en_trb.h"
+#include <net/trb.h>
 
 static bool mlx5e_hw_gro_supported(struct mlx5_core_dev *mdev)
 {
@@ -941,7 +942,10 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 		 * required state to clear. And page_pool gracefully handle
 		 * elevated refcnt.
 		 */
-		rq->page_pool = page_pool_create(&pp_params);
+        if (params->trb_enabled)
+            rq->page_pool = trb_register_pp(&pp_params, rq->buff.frame0_sz);
+        else
+		    rq->page_pool = page_pool_create(&pp_params);
 		if (IS_ERR(rq->page_pool)) {
 			err = PTR_ERR(rq->page_pool);
 			rq->page_pool = NULL;

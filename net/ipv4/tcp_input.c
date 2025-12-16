@@ -81,6 +81,7 @@
 #include <linux/jump_label_ratelimit.h>
 #include <net/busy_poll.h>
 #include <net/mptcp.h>
+#include <net/trb.h>
 
 int sysctl_tcp_max_orphans __read_mostly = NR_FILE;
 
@@ -5226,6 +5227,9 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 	enum skb_drop_reason reason;
 	bool fragstolen;
 	int eaten;
+#ifdef CONFIG_TRB_RX_RING_DEV
+	bool trb_pkt = READ_ONCE(skb->trb_pkt);
+#endif
 
 	/* If a subflow has been reset, the packet should not continue
 	 * to be processed, drop the packet.
@@ -5303,6 +5307,13 @@ queue_and_out:
 			tcp_sack_remove(tp);
 
 		tcp_fast_path_check(sk);
+
+#ifdef CONFIG_TRB_RX_RING_DEV
+		if (trb_pkt) {
+			if (!trb_tcp_queue_skb(sk, skb))
+				return;
+		}
+#endif
 
 		if (eaten > 0)
 			kfree_skb_partial(skb, fragstolen);
