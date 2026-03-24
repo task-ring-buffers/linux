@@ -103,18 +103,43 @@ struct queue_ctx {
 };
 
 struct trb_dev *rx_dev;
+static bool trb_dev_ready;
 
 struct queue_ctx *q;
 
 /* Exported TRB helpers */
 struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size);
 int trb_tcp_queue_skb(struct sock *sk, struct sk_buff *skb);
+struct page *trb_page_pool_alloc(struct page_pool *pool);
+static int build_meta_and_userspace_pool(struct trb_dev *d);
+
+static int trb_prepare_dev(void)
+{
+	int ret;
+
+	if (trb_dev_ready)
+		return 0;
+
+	rx_dev = kzalloc(sizeof(struct trb_dev), GFP_KERNEL);
+	if (!rx_dev)
+		return -ENOMEM;
+
+	ret = build_meta_and_userspace_pool(rx_dev);
+	if (ret) {
+		kfree(rx_dev);
+		rx_dev = NULL;
+		return ret;
+	}
+
+	trb_dev_ready = true;
+	return 0;
+}
 
 static int trb_mmap(struct file *file, struct vm_area_struct *vma)
 {
-    struct queue_ctx *q = file->private_data;
-    struct trb_dev *d = q->dev;
-    unsigned long len = vma->vm_end - vma->vm_start;
+	struct queue_ctx *q = file->private_data;
+	struct trb_dev *d = q->dev;
+	unsigned long len = vma->vm_end - vma->vm_start;
     unsigned long need = d->hdr->pool_off + (unsigned long)d->hdr->buf_cap * BUF_SIZE;
     unsigned long pool_pages = DIV_ROUND_UP((unsigned long)d->hdr->pool_size, PAGE_SIZE);
     unsigned long uaddr;
@@ -122,7 +147,7 @@ static int trb_mmap(struct file *file, struct vm_area_struct *vma)
     int i, ret;
     int off = 0;
     
-    pr_warn("Len: %u Need %u\n", len, need);
+    pr_warn("Len: %lu Need %lu\n", len, need);
     if (len < need)
         return -EINVAL;
     for (off = 0; off < d->meta_bytes ; off += PAGE_SIZE) {
@@ -187,7 +212,7 @@ static void drain_rr(struct recycle_ring *rr)
 /* This should also obviously take a queue context when hooked up with multiple cores */
 struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size)
 {
-	struct trb_dev *dev = rx_dev;
+	struct trb_dev *dev;
 	struct rx_ring_hdr *hdr;
 	struct page_pool *pool;
 	struct page *pg;
@@ -197,9 +222,16 @@ struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size)
 	unsigned long page_bytes;
 	int err = -EINVAL;
 
-	if (!dev || !pp || !buf_size)
+	if (!pp || !buf_size)
 		return ERR_PTR(-EINVAL);
 
+	if (!trb_dev_ready) {
+		int ret = trb_prepare_dev();
+		if (ret)
+			return ERR_PTR(ret);
+	}
+
+	dev = rx_dev;
 	hdr = dev->hdr;
 
 	pool = page_pool_create(pp);
@@ -446,16 +478,19 @@ static const struct file_operations trb_fops = {
 static int __init trb_init(void)
 {
     int ret;
-    int i;
+
+    rx_dev = NULL;
+    trb_dev_ready = false;
+
+    /*
+     * Only register the miscdevice at init; actual ring/pool
+     * allocation is deferred to the first trb_register_pp() call
+     * when a TRB-enabled RQ is created.
+     */
     rx_dev = kzalloc(sizeof(struct trb_dev), GFP_KERNEL);
     if (!rx_dev)
         return -ENOMEM;
-    
-    ret = build_meta_and_userspace_pool(rx_dev);
-    if (ret) {
-        kfree(rx_dev);
-        return ret;
-    }
+
     rx_dev->misc.minor = MISC_DYNAMIC_MINOR;
     rx_dev->misc.name = "trb_dev";
     rx_dev->misc.fops = &trb_fops;
@@ -463,21 +498,11 @@ static int __init trb_init(void)
 
     ret = misc_register(&rx_dev->misc);
     if (ret) {
-        if (rx_dev->bufs) {
-            for (i = 0; i < rx_dev->hdr->buf_cap; i++) {
-                if (rx_dev->bufs[i].page)
-                    page_pool_put_page(rx_dev->pp, rx_dev->bufs[i].page, 0, true);
-            }
-            kfree(rx_dev->bufs);
-            kfree(rx_dev->pages);
-            if (rx_dev->pp)
-                page_pool_destroy(rx_dev->pp);
-            vfree(rx_dev->meta_base);
-            kfree(rx_dev);
-            return ret;
-        }
+        kfree(rx_dev);
+        rx_dev = NULL;
+        return ret;
     }
-    pr_info("%s: ready. buf_cap=%u desc_cap=%u", DEV_NAME, rx_dev->hdr->buf_cap, rx_dev->hdr->desc_cap);
+    pr_info("%s: registered (deferred init)", DEV_NAME);
 	return 0;
 }
 
@@ -530,24 +555,23 @@ static struct page *trb_page_pool_dev_alloc_fast(struct page_pool *pool)
 }
 
 /* signature should take argument page_pool and queue_ctx. queue_ctx should help obtain the rr pointer when there is more than one core */
-struct page* trb_page_pool_alloc(struct page_pool* pool) 
+struct page* trb_page_pool_alloc(struct page_pool* pool)
 {
-	struct rx_ring_hdr *hdr;
-	struct page *page;
+	struct trb_dev *dev = rx_dev;
 
-	hdr = rx_dev->hdr;
-	drain_rr(hdr->rr);
-	page = trb_page_pool_dev_alloc_fast(pool);
-	return page;
+	if (!dev)
+		return NULL;
+
+	if (dev->rr)
+		drain_rr(dev->rr);
+
+	return trb_page_pool_dev_alloc_fast(pool);
 }
 EXPORT_SYMBOL_GPL(trb_page_pool_alloc);
 
 static inline bool trb_is_pp_page(struct page *page)
 {
-	netmem_ref netmem;
-
-	netmem = page_to_netmem(page);
-	return (netmem_get_pp_magic(netmem) & ~0x3UL) == PP_SIGNATURE;
+	return (page->pp_magic & ~0x3UL) == PP_SIGNATURE;
 }
 
 static int trb_buf_from_region(struct trb_dev *dev, struct page *page,
@@ -607,6 +631,20 @@ static int trb_count_segments_pp(struct sk_buff *skb)
 		}
 	}
 	return count;
+}
+
+/* Local copy of tcp_eat_recv_skb (not exported) to consume a skb from the rx queue */
+static void trb_tcp_eat_recv_skb(struct sock *sk, struct sk_buff *skb)
+{
+	__skb_unlink(skb, &sk->sk_receive_queue);
+	if (likely(skb->destructor == sock_rfree)) {
+		sock_rfree(skb);
+		skb->destructor = NULL;
+		skb->sk = NULL;
+		skb_attempt_defer_free(skb);
+		return;
+	}
+	__kfree_skb(skb);
 }
 
 /* Called after tcp_data_queue(); emit one descriptor per page-pool payload buffer. It should also have a struct queue_ctx *q param but for  not there is only 1 ctx and i have made it global */
@@ -703,7 +741,7 @@ int trb_tcp_queue_skb( struct sock *sk, struct sk_buff *skb)
 		}
 	}
 
-	tcp_eat_recv_skb(sk, skb);
+	trb_tcp_eat_recv_skb(sk, skb);
 	total_bytes = TCP_SKB_CB(skb)->end_seq - TCP_SKB_CB(skb)->seq;
 	WRITE_ONCE(tp->copied_seq, TCP_SKB_CB(skb)->end_seq);
 	tcp_cleanup_rbuf(sk, total_bytes);
@@ -717,17 +755,19 @@ static void __exit trb_exit(void)
     int i;
     if (rx_dev) {
         misc_deregister(&rx_dev->misc);
-        if (rx_dev->bufs) {
-            for (i = 0; i < rx_dev->hdr->buf_cap; i++) {
-                if (rx_dev->bufs[i].page)
-                    page_pool_put_page(rx_dev->pp, rx_dev->bufs[i].page, 0, true);
+        if (trb_dev_ready) {
+            if (rx_dev->bufs) {
+                for (i = 0; i < rx_dev->hdr->buf_cap; i++) {
+                    if (rx_dev->bufs[i].page)
+                        page_pool_put_page(rx_dev->pp, rx_dev->bufs[i].page, 0, true);
+                }
             }
+            kfree(rx_dev->bufs);
+            kfree(rx_dev->pages);
+            if (rx_dev->pp)
+                page_pool_destroy(rx_dev->pp);
+            vfree(rx_dev->meta_base);
         }
-        kfree(rx_dev->bufs);
-        kfree(rx_dev->pages);
-        if (rx_dev->pp)
-            page_pool_destroy(rx_dev->pp);
-        vfree(rx_dev->meta_base);
         kfree(rx_dev);
         }
 }
