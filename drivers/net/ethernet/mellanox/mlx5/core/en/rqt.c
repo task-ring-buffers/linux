@@ -131,6 +131,9 @@ static int mlx5e_calc_indir_rqns(u32 *rss_rqns, u32 *rqns, u32 *rss_vhca_ids, u3
 		if (vhca_ids)
 			rss_vhca_ids[i] = vhca_ids[ix];
 	}
+	/* Delete this -- just for trb debugging */
+	for (i = 0; i < num_rqns; i++) {
+	}
 
 	return 0;
 }

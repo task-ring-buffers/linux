@@ -3281,6 +3281,7 @@ static int mlx5e_switch_priv_channels(struct mlx5e_priv *priv,
 	if (preactivate) {
 		err = preactivate(priv, context);
 		if (err) {
+			pr_warn("preactivate error\n");
 			priv->channels = old_chs;
 			goto trb_activate;
 		}
@@ -5974,9 +5975,12 @@ mlx5e_calc_max_nch(struct mlx5_core_dev *mdev, struct net_device *netdev,
 
 	/* core resources */
 	max_nch = mlx5e_profile_max_num_channels(mdev, profile);
-
+	
+	pr_warn("Core resources no of channels : %d\n", max_nch);
 	/* netdev rx queues */
 	max_nch = min_t(unsigned int, max_nch, netdev->num_rx_queues);
+
+	pr_warn("Netdev rx queues no of channels : %d\n", netdev->num_rx_queues);
 
 	/* netdev tx queues */
 	tmp = netdev->num_tx_queues;
@@ -5986,7 +5990,8 @@ mlx5e_calc_max_nch(struct mlx5_core_dev *mdev, struct net_device *netdev,
 		tmp -= profile->max_tc;
 	tmp = tmp / profile->max_tc;
 	max_nch = min_t(unsigned int, max_nch, tmp);
-
+	
+	pr_warn("Tmp no of channels : %d", tmp);
 	return max_nch;
 }
 
