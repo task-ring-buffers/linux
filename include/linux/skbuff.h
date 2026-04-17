@@ -613,6 +613,10 @@ struct skb_shared_info {
 	 * remains valid until skb destructor */
 	void *		destructor_arg;
 
+#ifdef CONFIG_TRB_RX_RING_DEV
+	__u32		trb_page_ix[MAX_SKB_FRAGS];
+#endif
+
 	/* must be last field, see pskb_expand_head() */
 	skb_frag_t	frags[MAX_SKB_FRAGS];
 };
@@ -946,6 +950,7 @@ struct sk_buff {
 				pp_recycle:1; /* page_pool recycle indicator */
 #ifdef CONFIG_TRB_RX_RING_DEV
 	__u8			trb_pkt;
+	__u32			trb_head_page_ix;
 #endif
 #ifdef CONFIG_SKB_EXTENSIONS
 	__u8			active_extensions;

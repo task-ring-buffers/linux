@@ -71,12 +71,25 @@ struct recycle_ring {
     __u32 entries[];
 };
 
+struct trb_free_entry {
+	struct page *page;
+	__u32 page_ix;
+};
+
+struct trb_free_ring {
+	__u32 prod;
+	__u32 con;
+	__u32 cap; /* number of TRB pages tracked */
+	struct trb_free_entry entries[];
+};
+
 /* Kernel private state */
 
 struct buf_map_entry {
 	struct page *page;
 	dma_addr_t dma_base;
-	struct sk_buff *skb_ref; /* extra ref held while userspace reads */
+	__u32 page_ix;
+	__u32 inflight;
 };
 
 struct trb_dev {
@@ -94,6 +107,7 @@ struct trb_dev {
     struct page_pool *pp;
     struct buf_map_entry *bufs;
     struct page **pages;
+    struct trb_free_ring *free_ring;
 
 };
 
@@ -110,7 +124,8 @@ struct queue_ctx *q;
 /* Exported TRB helpers */
 struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size);
 int trb_tcp_queue_skb(struct sock *sk, struct sk_buff *skb);
-struct page *trb_page_pool_alloc(struct page_pool *pool);
+struct page *trb_page_pool_alloc(u32 *idx);
+int trb_free_ring_return(struct page *page, u32 idx);
 static int build_meta_and_userspace_pool(struct trb_dev *d);
 
 static int trb_prepare_dev(void)
@@ -147,7 +162,6 @@ static int trb_mmap(struct file *file, struct vm_area_struct *vma)
     int i, ret;
     int off = 0;
     
-    pr_warn("Len: %lu Need %lu\n", len, need);
     if (len < need)
         return -EINVAL;
     for (off = 0; off < d->meta_bytes ; off += PAGE_SIZE) {
@@ -158,10 +172,11 @@ static int trb_mmap(struct file *file, struct vm_area_struct *vma)
         if (ret)
             return ret;
     }
-
     uaddr = vma->vm_start + d->hdr->pool_off;
+    pr_warn("MMAPPING %u pages\n", pool_pages);
     for (i = 0; i < pool_pages; i++, uaddr += PAGE_SIZE) {
-        ret = vm_insert_page(vma, uaddr, d->pages[i]);
+        pg = d->pages[i];
+        ret = vm_insert_page(vma, uaddr, pg);
         if (ret)
             return ret;
     }
@@ -191,6 +206,29 @@ static inline void rr_push(struct recycle_ring *rr, __u32 v)
     smp_store_release(&rr->prod, prod + 1);
 }
 
+static inline void trb_buf_put_page(struct trb_dev *dev, __u32 buf_id)
+{
+	struct buf_map_entry *b = &dev->bufs[buf_id];
+	long ret;
+
+	ret = page_pool_unref_page(b->page, 1);
+	if (ret) {
+		pr_warn("TRB put path=drain_rr page_ix=%u ref_after=%ld to_free_ring=0\n",
+			b->page_ix, ret);
+		return;
+	}
+
+	if (!trb_free_ring_return(b->page, b->page_ix)) {
+		pr_warn("TRB put path=drain_rr page_ix=%u ref_after=0 to_free_ring=1\n",
+			b->page_ix);
+		return;
+	}
+
+	pr_warn("TRB put path=drain_rr page_ix=%u ref_after=0 to_free_ring=0\n",
+		b->page_ix);
+	page_pool_put_unrefed_page(dev->pp, b->page, -1, false);
+}
+
 /* Placeholder: assume userspace provides buf_ids to recycle */
 static void drain_rr(struct recycle_ring *rr)
 {
@@ -203,10 +241,11 @@ static void drain_rr(struct recycle_ring *rr)
 	while (rr_pop(rr, &buf_id)) {
 		if (buf_id >= dev->hdr->buf_cap)
 			continue;
-		if (dev->bufs[buf_id].skb_ref) {
-			kfree_skb(dev->bufs[buf_id].skb_ref);
-			dev->bufs[buf_id].skb_ref = NULL;
-		}
+		if (!dev->bufs[buf_id].inflight)
+			continue;
+
+		dev->bufs[buf_id].inflight--;
+		trb_buf_put_page(dev, buf_id);
 	}
 }
 /* This should also obviously take a queue context when hooked up with multiple cores */
@@ -215,9 +254,11 @@ struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size)
 	struct trb_dev *dev;
 	struct rx_ring_hdr *hdr;
 	struct page_pool *pool;
+	struct trb_free_ring *free_ring = NULL;
 	struct page *pg;
 	size_t bufs_per_page;
 	size_t total_bufs;
+	size_t free_ring_bytes;
 	size_t i, j, idx;
 	unsigned long page_bytes;
 	int err = -EINVAL;
@@ -264,19 +305,32 @@ struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size)
 		}
 
 		dev->pages[i] = pg;
-		WRITE_ONCE(pg->_pp_mapping_pad, (unsigned long)i);
 
-		for (j = 0; j < bufs_per_page; j++) {
-			idx = i * bufs_per_page + j;
-			dev->bufs[idx].page = pg;
-			dev->bufs[idx].dma_base = (dma_addr_t)(j * buf_size);
+			for (j = 0; j < bufs_per_page; j++) {
+				idx = i * bufs_per_page + j;
+				dev->bufs[idx].page = pg;
+				dev->bufs[idx].dma_base = (dma_addr_t)(j * buf_size);
+				dev->bufs[idx].page_ix = i;
+				dev->bufs[idx].inflight = 0;
+			}
 		}
+
+	free_ring_bytes = struct_size(free_ring, entries, pp->pool_size);
+	free_ring = kvzalloc(free_ring_bytes, GFP_KERNEL);
+	if (!free_ring) {
+		err = -ENOMEM;
+		goto err_release_pages;
 	}
 
+	free_ring->con = 0;
+	free_ring->prod = pp->pool_size;
+	free_ring->cap = pp->pool_size;
 	for (i = 0; i < pp->pool_size; i++) {
-		if (dev->pages[i])
-			page_pool_put_page(pool, dev->pages[i], 0, true);
+		free_ring->entries[i].page = dev->pages[i];
+		free_ring->entries[i].page_ix = i;
 	}
+	kvfree(dev->free_ring);
+	dev->free_ring = free_ring;
 
 	hdr->buf_size = buf_size;
 	hdr->buf_cap = total_bufs;
@@ -291,6 +345,7 @@ err_release_pages:
 			dev->pages[i] = NULL;
 		}
 	}
+	kvfree(free_ring);
 	kfree(dev->bufs);
 	dev->bufs = NULL;
 err_free_pages:
@@ -506,56 +561,54 @@ static int __init trb_init(void)
 	return 0;
 }
 
-#ifdef CONFIG_PAGE_POOL_STATS
-#define trb_alloc_stat_inc(pool, field) ((pool)->alloc_stats.field++)
-#else
-#define trb_alloc_stat_inc(pool, field) do { } while (0)
-#endif
-
-static netmem_ref trb_page_pool_refill_cache(struct page_pool *pool)
+static struct page *trb_free_ring_alloc(struct trb_dev *dev, __u32 *idx)
 {
-	struct ptr_ring *ring = &pool->ring;
-	netmem_ref netmem;
+	struct trb_free_ring *ring;
+	struct trb_free_entry *entry;
+	u32 con;
 
-	if (__ptr_ring_empty(ring)) {
-		trb_alloc_stat_inc(pool, empty);
-		return 0;
-	}
-
-	do {
-		netmem = (__force netmem_ref)__ptr_ring_consume(ring);
-		if (!netmem)
-			break;
-
-		pool->alloc.cache[pool->alloc.count++] = netmem;
-	} while (pool->alloc.count < PP_ALLOC_CACHE_REFILL);
-
-	if (!pool->alloc.count)
-		return 0;
-
-	trb_alloc_stat_inc(pool, refill);
-	return pool->alloc.cache[--pool->alloc.count];
-}
-
-static struct page *trb_page_pool_dev_alloc_fast(struct page_pool *pool)
-{
-	netmem_ref netmem;
-
-	if (likely(pool->alloc.count)) {
-		netmem = pool->alloc.cache[--pool->alloc.count];
-		trb_alloc_stat_inc(pool, fast);
-		return netmem_to_page(netmem);
-	}
-
-	netmem = trb_page_pool_refill_cache(pool);
-	if (!netmem)
+	if (!dev || !dev->free_ring)
 		return NULL;
 
-	return netmem_to_page(netmem);
+	ring = dev->free_ring;
+	con = READ_ONCE(ring->con);
+	if (con == READ_ONCE(ring->prod))
+		return NULL;
+
+	entry = &ring->entries[con & (ring->cap - 1)];
+	*idx = entry->page_ix;
+	pr_warn("TRB alloc: idx=%u page=%px con=%u prod=%u\n",
+		*idx, entry->page, con, READ_ONCE(ring->prod));
+	smp_store_release(&ring->con, con + 1);
+	return entry->page;
 }
 
+int trb_free_ring_return(struct page *page, __u32 idx)
+{
+	struct trb_dev *dev = rx_dev;
+	struct trb_free_ring *ring;
+	struct trb_free_entry *entry;
+	u32 prod;
+
+	if (!dev || !dev->free_ring || !page)
+		return -EINVAL;
+
+	ring = dev->free_ring;
+	prod = READ_ONCE(ring->prod);
+	if (prod - READ_ONCE(ring->con) >= ring->cap)
+		return -ENOSPC;
+
+	entry = &ring->entries[prod & (ring->cap - 1)];
+	entry->page = page;
+	entry->page_ix = idx;
+	pr_warn("TRB return idx=%u\n", idx);
+	smp_store_release(&ring->prod, prod + 1);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(trb_free_ring_return);
+
 /* signature should take argument page_pool and queue_ctx. queue_ctx should help obtain the rr pointer when there is more than one core */
-struct page* trb_page_pool_alloc(struct page_pool* pool)
+struct page* trb_page_pool_alloc(__u32 *idx)
 {
 	struct trb_dev *dev = rx_dev;
 
@@ -565,7 +618,7 @@ struct page* trb_page_pool_alloc(struct page_pool* pool)
 	if (dev->rr)
 		drain_rr(dev->rr);
 
-	return trb_page_pool_dev_alloc_fast(pool);
+	return trb_free_ring_alloc(dev, idx);
 }
 EXPORT_SYMBOL_GPL(trb_page_pool_alloc);
 
@@ -574,11 +627,10 @@ static inline bool trb_is_pp_page(struct page *page)
 	return (page->pp_magic & ~0x3UL) == PP_SIGNATURE;
 }
 
-static int trb_buf_from_region(struct trb_dev *dev, struct page *page,
+static int trb_buf_from_region(struct trb_dev *dev, u32 page_ix, struct page *page,
 			       u32 payload_start, u32 len,
 			       u32 *buf_id, u32 *off, u32 *seg_len)
 {
-	u32 page_ix;
 	u32 bufs_per_page;
 	u32 page_bytes;
 	u32 buf_idx_in_page;
@@ -586,11 +638,13 @@ static int trb_buf_from_region(struct trb_dev *dev, struct page *page,
 	if (!page || !len)
 		return -EINVAL;
 
-	page_ix = READ_ONCE(page->_pp_mapping_pad);
+	if (!dev->free_ring)
+		return -EINVAL;
+
 	page_bytes = PAGE_SIZE << compound_order(page);
 	bufs_per_page = DIV_ROUND_UP(page_bytes, dev->hdr->buf_size);
 
-	if (page_ix >= dev->hdr->buf_cap)
+	if (page_ix >= dev->free_ring->cap)
 		return -EINVAL;
 	if (payload_start >= page_bytes)
 		return -EINVAL;
@@ -602,35 +656,121 @@ static int trb_buf_from_region(struct trb_dev *dev, struct page *page,
 	return 0;
 }
 
+static int trb_count_segments_pp_one(struct sk_buff *skb)
+{
+	struct skb_shared_info *sh;
+	struct page *head_page;
+	u32 head_len;
+	struct sk_buff *frag_skb;
+	int count = 0;
+	int i;
+
+	if (!skb)
+		return 0;
+
+	sh = skb_shinfo(skb);
+	head_page = virt_to_head_page(skb->data);
+	head_len = skb_headlen(skb);
+
+	if (head_len && trb_is_pp_page(head_page))
+		count++;
+
+	for (i = 0; i < sh->nr_frags; i++) {
+		if (trb_is_pp_page(skb_frag_page(&sh->frags[i])))
+			count++;
+	}
+
+	skb_walk_frags(skb, frag_skb)
+		count += trb_count_segments_pp_one(frag_skb);
+
+	return count;
+}
+
 static int trb_count_segments_pp(struct sk_buff *skb)
 {
-	struct sk_buff *iter;
-	int count;
+	return trb_count_segments_pp_one(skb);
+}
 
-	iter = skb;
-	count = 0;
-	for (; iter; iter = iter->next) {
-		struct skb_shared_info *sh;
-		struct page *head_page;
-		u32 head_len;
-		int i;
+static int trb_emit_segments_pp_one(struct trb_dev *dev, struct sk_buff *skb,
+				    u32 prod, int *seg_idx)
+{
+	struct rx_ring_hdr *hdr = dev->hdr;
+	struct skb_shared_info *sh;
+	struct page *head_page;
+	u32 head_len;
+	struct trb_desc *td;
+	struct sk_buff *frag_skb;
+	int i;
 
-		sh = skb_shinfo(iter);
-		head_page = virt_to_head_page(iter->data);
-		head_len = skb_headlen(iter);
+	sh = skb_shinfo(skb);
+	head_page = virt_to_head_page(skb->data);
+	head_len = skb_headlen(skb);
 
-		if (head_len && trb_is_pp_page(head_page))
-			count++;
-		for (i = 0; i < sh->nr_frags; i++) {
-			if (trb_is_pp_page(skb_frag_page(&sh->frags[i])))
-				count++;
+	if (head_len && trb_is_pp_page(head_page)) {
+		u32 buf_id, off, seg_len, payload_start, page_ix;
+
+		payload_start = (u32)((unsigned long)skb->data -
+				      (unsigned long)page_address(head_page));
+		page_ix = READ_ONCE(skb->trb_head_page_ix);
+		if (trb_buf_from_region(dev, page_ix, head_page, payload_start,
+					head_len, &buf_id, &off, &seg_len))
+			return -EINVAL;
+		pr_warn("TRB emit head: page_ix=%u buf_id=%u off=%u len=%u payload_start=%u buf_size=%u\n",
+			page_ix, buf_id, off, seg_len, payload_start, dev->hdr->buf_size);
+
+		td = &dev->rx_desc[(prod + *seg_idx) & (hdr->desc_cap - 1)];
+			WRITE_ONCE(td->buf_id, buf_id);
+			WRITE_ONCE(td->len, seg_len);
+			WRITE_ONCE(td->off, off);
+			WRITE_ONCE(td->flags, 0);
+			pr_warn("TRB emit store head: buf_id=%u skb=%px users=%d active_ext=%u ext=%px trb_pkt=%u trb_head_ix=%u\n",
+				buf_id, skb, refcount_read(&skb->users),
+				skb->active_extensions, skb->extensions,
+				skb->trb_pkt, skb->trb_head_page_ix);
+			page_pool_ref_page(dev->bufs[buf_id].page);
+			dev->bufs[buf_id].inflight++;
+			(*seg_idx)++;
 		}
-		if (sh->frag_list) {
-			iter = sh->frag_list;
+
+	for (i = 0; i < sh->nr_frags; i++) {
+		struct page *fp;
+		u32 buf_id, off, seg_len, payload_start, page_ix;
+
+		fp = skb_frag_page(&sh->frags[i]);
+		if (!trb_is_pp_page(fp))
 			continue;
+
+		payload_start = skb_frag_off(&sh->frags[i]);
+		page_ix = READ_ONCE(sh->trb_page_ix[i]);
+		if (trb_buf_from_region(dev, page_ix, fp, payload_start,
+					skb_frag_size(&sh->frags[i]),
+					&buf_id, &off, &seg_len))
+			return -EINVAL;
+		pr_warn("TRB emit frag: page_ix=%u buf_id=%u off=%u len=%u payload_start=%u buf_size=%u\n",
+			page_ix, buf_id, off, seg_len, payload_start, dev->hdr->buf_size);
+
+		td = &dev->rx_desc[(prod + *seg_idx) & (hdr->desc_cap - 1)];
+			WRITE_ONCE(td->buf_id, buf_id);
+			WRITE_ONCE(td->len, seg_len);
+			WRITE_ONCE(td->off, off);
+			WRITE_ONCE(td->flags, 0);
+			pr_warn("TRB emit store frag: buf_id=%u skb=%px users=%d active_ext=%u ext=%px trb_pkt=%u trb_head_ix=%u\n",
+				buf_id, skb, refcount_read(&skb->users),
+				skb->active_extensions, skb->extensions,
+				skb->trb_pkt, skb->trb_head_page_ix);
+			page_pool_ref_page(dev->bufs[buf_id].page);
+			dev->bufs[buf_id].inflight++;
+			(*seg_idx)++;
 		}
+
+	skb_walk_frags(skb, frag_skb) {
+        pr_warn("Walking SKB frags\n");
+		int err = trb_emit_segments_pp_one(dev, frag_skb, prod, seg_idx);
+		if (err)
+			return err;
 	}
-	return count;
+
+	return 0;
 }
 
 /* Local copy of tcp_eat_recv_skb (not exported) to consume a skb from the rx queue */
@@ -652,9 +792,7 @@ int trb_tcp_queue_skb( struct sock *sk, struct sk_buff *skb)
 {
 	struct trb_dev *dev;
 	struct rx_ring_hdr *hdr;
-	struct trb_desc *td;
 	struct tcp_sock *tp;
-	struct sk_buff *iter;
 	struct queue_ctx *ctx = q;
 	u32 prod;
 	u32 con;
@@ -672,74 +810,15 @@ int trb_tcp_queue_skb( struct sock *sk, struct sk_buff *skb)
 	con = smp_load_acquire(&hdr->con);
 	prod = READ_ONCE(hdr->prod);
 	seg_count = trb_count_segments_pp(skb);
+
 	if (!seg_count)
 		return -EOPNOTSUPP;
 	if (prod - con + seg_count > hdr->desc_cap)
 		return -ENOSPC;
 
 	seg_idx = 0;
-	iter = skb;
-	for (; iter; iter = iter->next) {
-		struct skb_shared_info *sh;
-		struct page *head_page;
-		u32 head_len;
-		int i;
-
-		sh = skb_shinfo(iter);
-		head_page = virt_to_head_page(iter->data);
-		head_len = skb_headlen(iter);
-
-		if (head_len && trb_is_pp_page(head_page)) {
-			u32 buf_id;
-			u32 off;
-			u32 seg_len;
-			u32 payload_start;
-
-			payload_start = (u32)((unsigned long)iter->data -
-					      (unsigned long)page_address(head_page));
-			if (trb_buf_from_region(dev, head_page, payload_start,
-						head_len, &buf_id, &off, &seg_len))
-				return -EINVAL;
-
-			td = &dev->rx_desc[(prod + seg_idx) & (hdr->desc_cap - 1)];
-			WRITE_ONCE(td->buf_id, buf_id);
-			WRITE_ONCE(td->len, seg_len);
-			WRITE_ONCE(td->off, off);
-			WRITE_ONCE(td->flags, 0);
-			dev->bufs[buf_id].skb_ref = skb_get(iter);
-			seg_idx++;
-		}
-
-		for (i = 0; i < sh->nr_frags; i++) {
-			struct page *fp;
-			u32 buf_id;
-			u32 off;
-			u32 seg_len;
-			u32 payload_start;
-
-			fp = skb_frag_page(&sh->frags[i]);
-			if (!trb_is_pp_page(fp))
-				continue;
-			payload_start = skb_frag_off(&sh->frags[i]);
-			if (trb_buf_from_region(dev, fp, payload_start,
-						skb_frag_size(&sh->frags[i]),
-						&buf_id, &off, &seg_len))
-				return -EINVAL;
-
-			td = &dev->rx_desc[(prod + seg_idx) & (hdr->desc_cap - 1)];
-			WRITE_ONCE(td->buf_id, buf_id);
-			WRITE_ONCE(td->len, seg_len);
-			WRITE_ONCE(td->off, off);
-			WRITE_ONCE(td->flags, 0);
-			dev->bufs[buf_id].skb_ref = skb_get(iter);
-			seg_idx++;
-		}
-
-		if (sh->frag_list) {
-			iter = sh->frag_list;
-			continue;
-		}
-	}
+	if (trb_emit_segments_pp_one(dev, skb, prod, &seg_idx))
+		return -EINVAL;
 
 	trb_tcp_eat_recv_skb(sk, skb);
 	total_bytes = TCP_SKB_CB(skb)->end_seq - TCP_SKB_CB(skb)->seq;
@@ -764,6 +843,7 @@ static void __exit trb_exit(void)
             }
             kfree(rx_dev->bufs);
             kfree(rx_dev->pages);
+            kvfree(rx_dev->free_ring);
             if (rx_dev->pp)
                 page_pool_destroy(rx_dev->pp);
             vfree(rx_dev->meta_base);

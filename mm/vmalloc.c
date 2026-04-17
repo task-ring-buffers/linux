@@ -4443,25 +4443,33 @@ int remap_vmalloc_range_partial(struct vm_area_struct *vma, unsigned long uaddr,
 	unsigned long off;
 	unsigned long end_index;
 
+	pr_warn("MMAP FAIL 0\n");
+
 	if (check_shl_overflow(pgoff, PAGE_SHIFT, &off))
 		return -EINVAL;
-
+	pr_warn("MMAP FAIL 1\n");
 	size = PAGE_ALIGN(size);
 
 	if (!PAGE_ALIGNED(uaddr) || !PAGE_ALIGNED(kaddr))
 		return -EINVAL;
+	pr_warn("MMAP FAIL 2\n");
 
 	area = find_vm_area(kaddr);
 	if (!area)
 		return -EINVAL;
 
+	pr_warn("MMAP FAIL 3\n");
+
 	if (!(area->flags & (VM_USERMAP | VM_DMA_COHERENT)))
 		return -EINVAL;
-
+	
+	pr_warn("MMAP FAIL 4\n");
 	if (check_add_overflow(size, off, &end_index) ||
 	    end_index > get_vm_area_size(area))
 		return -EINVAL;
 	kaddr += off;
+
+	pr_warn("MMAP FAIL 5\n");
 
 	do {
 		struct page *page = vmalloc_to_page(kaddr);

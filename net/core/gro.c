@@ -101,7 +101,8 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
 	unsigned int new_truesize;
 	struct sk_buff *lp;
 	int segs;
-
+    
+    pr_warn("TRB debug: skb_gro_receive called\n");
 	/* Do not splice page pool based packets w/ non-page pool
 	 * packets. This can result in reference count issues as page
 	 * pool pages will not decrement the reference count and will
@@ -132,6 +133,10 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
 		skb_frag_t *frag2;
 		int i = skbinfo->nr_frags;
 		int nr_frags = pinfo->nr_frags + i;
+#ifdef CONFIG_TRB_RX_RING_DEV
+		__u32 *page_ix;
+		__u32 *page_ix2;
+#endif
 
 		if (nr_frags > MAX_SKB_FRAGS)
 			goto merge;
@@ -142,8 +147,15 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
 
 		frag = pinfo->frags + nr_frags;
 		frag2 = skbinfo->frags + i;
+#ifdef CONFIG_TRB_RX_RING_DEV
+		page_ix = pinfo->trb_page_ix + nr_frags;
+		page_ix2 = skbinfo->trb_page_ix + i;
+#endif
 		do {
 			*--frag = *--frag2;
+#ifdef CONFIG_TRB_RX_RING_DEV
+			*--page_ix = *--page_ix2;
+#endif
 		} while (--i);
 
 		skb_frag_off_add(frag, offset);
@@ -176,8 +188,16 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
 		pinfo->nr_frags = nr_frags + 1 + skbinfo->nr_frags;
 
 		skb_frag_fill_page_desc(frag, page, first_offset, first_size);
+#ifdef CONFIG_TRB_RX_RING_DEV
+		pinfo->trb_page_ix[nr_frags] = skb->trb_head_page_ix;
+#endif
 
 		memcpy(frag + 1, skbinfo->frags, sizeof(*frag) * skbinfo->nr_frags);
+#ifdef CONFIG_TRB_RX_RING_DEV
+		memcpy(pinfo->trb_page_ix + nr_frags + 1,
+		       skbinfo->trb_page_ix,
+		       skbinfo->nr_frags * sizeof(pinfo->trb_page_ix[0]));
+#endif
 		/* We dont need to clear skbinfo->nr_frags here */
 
 		new_truesize = SKB_DATA_ALIGN(sizeof(struct sk_buff));

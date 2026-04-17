@@ -324,11 +324,16 @@ static int mlx5e_page_alloc_fragmented(struct mlx5e_rq *rq,
 				       struct mlx5e_frag_page *frag_page)
 {
 	struct page *page;
-
-	if (rq->priv->channels.params.trb_enabled)
-		page = trb_page_pool_alloc(rq->page_pool);
-	else
+	u32 trb_page_ix = 0;
+	if (rq->priv->channels.params.trb_enabled && rq->ix != 0) {
+        pr_warn("TRB page is allocated: rq_ix: %d \n", rq->ix);
+		page = trb_page_pool_alloc(&trb_page_ix);
+		pr_warn("TRB assigned page_ix=%u rq_ix=%d page=%px\n",
+			trb_page_ix, rq->ix, page);
+    }
+	else {
 		page = page_pool_dev_alloc_pages(rq->page_pool);
+    }
 	if (unlikely(!page))
 		return -ENOMEM;
 
@@ -337,7 +342,15 @@ static int mlx5e_page_alloc_fragmented(struct mlx5e_rq *rq,
 	*frag_page = (struct mlx5e_frag_page) {
 		.page	= page,
 		.frags	= 0,
+#ifdef CONFIG_TRB_RX_RING_DEV
+		.trb_page_ix = trb_page_ix,
+#endif
 	};
+#ifdef CONFIG_TRB_RX_RING_DEV
+	if (rq->priv->channels.params.trb_enabled && rq->ix != 0)
+		pr_warn("TRB frag_page->trb_page_ix=%u rq_ix=%d page=%px\n",
+			frag_page->trb_page_ix, rq->ix, frag_page->page);
+#endif
 
 	return 0;
 }
@@ -348,8 +361,18 @@ static void mlx5e_page_release_fragmented(struct mlx5e_rq *rq,
 	u16 drain_count = MLX5E_PAGECNT_BIAS_MAX - frag_page->frags;
 	struct page *page = frag_page->page;
 
-	if (page_pool_unref_page(page, drain_count) == 0)
+	if (page_pool_unref_page(page, drain_count) == 0) {
+#ifdef CONFIG_TRB_RX_RING_DEV
+		if (rq->priv->channels.params.trb_enabled && rq->ix != 0) {
+			if (trb_free_ring_return(page, frag_page->trb_page_ix))
+				page_pool_put_unrefed_page(rq->page_pool, page, -1, true);
+		} else {
+			page_pool_put_unrefed_page(rq->page_pool, page, -1, true);
+		}
+#else
 		page_pool_put_unrefed_page(rq->page_pool, page, -1, true);
+#endif
+	}
 }
 
 static inline int mlx5e_get_rx_frag(struct mlx5e_rq *rq,
@@ -1680,7 +1703,7 @@ static inline void mlx5e_complete_rx_cqe(struct mlx5e_rq *rq,
 	stats->bytes += cqe_bcnt;
 	mlx5e_build_rx_skb(cqe, cqe_bcnt, rq, skb);
 #ifdef CONFIG_TRB_RX_RING_DEV
-	skb->trb_pkt = rq->priv->channels.params.trb_enabled;
+	skb->trb_pkt = rq->priv->channels.params.trb_enabled && rq->ix != 0;
 #endif
 }
 
@@ -2240,6 +2263,13 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 
 	/* queue up for recycling/reuse */
 	skb_mark_for_recycle(skb);
+#ifdef CONFIG_TRB_RX_RING_DEV
+	if (rq->priv->channels.params.trb_enabled && rq->ix != 0)
+		pr_warn("TRB pre-set head idx: skb=%px active_ext=%u ext=%px trb_pkt=%u trb_head_ix=%u\n",
+			skb, skb->active_extensions, skb->extensions,
+			skb->trb_pkt, skb->trb_head_page_ix);
+	skb->trb_head_page_ix = frag_page->trb_page_ix;
+#endif
 	frag_page->frags++;
 
 	return skb;
@@ -2739,6 +2769,7 @@ int mlx5e_rq_set_handlers(struct mlx5e_rq *rq, struct mlx5e_params *params, bool
 	struct net_device *netdev = rq->netdev;
 	struct mlx5_core_dev *mdev = rq->mdev;
 	struct mlx5e_priv *priv = rq->priv;
+	const void *skb_builder = NULL;
 
 	switch (rq->wq_type) {
 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
@@ -2747,6 +2778,7 @@ int mlx5e_rq_set_handlers(struct mlx5e_rq *rq, struct mlx5e_params *params, bool
 			mlx5e_rx_mpwqe_is_linear_skb(mdev, params, NULL) ?
 				mlx5e_skb_from_cqe_mpwrq_linear :
 				mlx5e_skb_from_cqe_mpwrq_nonlinear;
+		skb_builder = rq->mpwqe.skb_from_cqe_mpwrq;
 		rq->post_wqes = mlx5e_post_rx_mpwqes;
 		rq->dealloc_wqe = mlx5e_dealloc_rx_mpwqe;
 
@@ -2771,6 +2803,7 @@ int mlx5e_rq_set_handlers(struct mlx5e_rq *rq, struct mlx5e_params *params, bool
 			mlx5e_rx_is_linear_skb(mdev, params, NULL) ?
 				mlx5e_skb_from_cqe_linear :
 				mlx5e_skb_from_cqe_nonlinear;
+		skb_builder = rq->wqe.skb_from_cqe;
 		rq->post_wqes = mlx5e_post_rx_wqes;
 		rq->dealloc_wqe = mlx5e_dealloc_rx_wqe;
 		rq->handle_rx_cqe = priv->profile->rx_handlers->handle_rx_cqe;
@@ -2779,6 +2812,9 @@ int mlx5e_rq_set_handlers(struct mlx5e_rq *rq, struct mlx5e_params *params, bool
 			return -EINVAL;
 		}
 	}
+	if (params->trb_enabled && rq->ix != 0)
+		pr_warn("TRB skb builder: rq=%d wq_type=%u fn=%ps\n",
+			rq->ix, rq->wq_type, skb_builder);
 
 	return 0;
 }

@@ -2027,16 +2027,25 @@ static int validate_page_before_insert(struct vm_area_struct *vma,
 {
 	struct folio *folio = page_folio(page);
 
-	if (!folio_ref_count(folio))
+	if (!folio_ref_count(folio)) {
+        pr_warn("Failing on refcount\n");
 		return -EINVAL;
+    }
 	if (unlikely(is_zero_folio(folio))) {
-		if (!vm_mixed_zeropage_allowed(vma))
+		if (!vm_mixed_zeropage_allowed(vma)){
+            pr_warn("Failing on refcount\n");
 			return -EINVAL;
+        }
 		return 0;
 	}
 	if (folio_test_anon(folio) || folio_test_slab(folio) ||
-	    page_has_type(page))
+	    page_has_type(page)) {
+		pr_warn("vm_insert reject: anon=%d slab=%d type=%d page_type=0x%x ref=%d page=%px\n",
+			folio_test_anon(folio), folio_test_slab(folio),
+			page_has_type(page), READ_ONCE(page->page_type),
+			page_ref_count(page), page);
 		return -EINVAL;
+	}
 	flush_dcache_folio(folio);
 	return 0;
 }
@@ -2070,8 +2079,10 @@ static int insert_page(struct vm_area_struct *vma, unsigned long addr,
 	spinlock_t *ptl;
 
 	retval = validate_page_before_insert(vma, page);
-	if (retval)
+	if (retval) {
+        pr_warn("page validate is failing\n");
 		goto out;
+    }
 	retval = -ENOMEM;
 	pte = get_locked_pte(vma->vm_mm, addr, &ptl);
 	if (!pte)

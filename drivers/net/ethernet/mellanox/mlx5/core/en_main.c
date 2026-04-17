@@ -942,7 +942,7 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 		 * required state to clear. And page_pool gracefully handle
 		 * elevated refcnt.
 		 */
-        if (params->trb_enabled)
+        if (params->trb_enabled && rq->ix != 0)
             rq->page_pool = trb_register_pp(&pp_params, rq->buff.frame0_sz);
         else
 		    rq->page_pool = page_pool_create(&pp_params);
@@ -3310,7 +3310,7 @@ trb_activate:
 			//priv->channels = old_chs
 			goto err_destroy_trb;
 		}
-		params.type = TRB_FS_IPV4_UDP;
+		params.type = TRB_FS_IPV4_TCP;
 		params.dport = 8080;
 		err = mlx5e_create_trb_table(priv->fs, priv->rx_res, &params);
 		if (err) {

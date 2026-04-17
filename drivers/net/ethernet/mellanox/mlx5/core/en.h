@@ -550,6 +550,9 @@ struct mlx5e_icosq {
 struct mlx5e_frag_page {
 	struct page *page;
 	u16 frags;
+#ifdef CONFIG_TRB_RX_RING_DEV
+	u32 trb_page_ix;
+#endif
 };
 
 enum mlx5e_wqe_frag_flag {

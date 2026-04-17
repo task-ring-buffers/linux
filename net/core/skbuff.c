@@ -78,6 +78,9 @@
 #include <net/mctp.h>
 #include <net/page_pool/helpers.h>
 #include <net/dropreason.h>
+#ifdef CONFIG_TRB_RX_RING_DEV
+#include <net/trb.h>
+#endif
 
 #include <linux/uaccess.h>
 #include <trace/events/skb.h>
@@ -1040,6 +1043,39 @@ bool napi_pp_put_page(netmem_ref netmem)
 EXPORT_SYMBOL(napi_pp_put_page);
 #endif
 
+#ifdef CONFIG_TRB_RX_RING_DEV
+static bool skb_trb_pp_put_page(struct page *page, u32 page_ix)
+{
+	netmem_ref netmem = page_to_netmem(page);
+	struct page_pool *pool;
+	long ret;
+
+	if (unlikely(!is_pp_netmem(netmem)))
+		return false;
+
+	pool = netmem_get_pp(netmem);
+
+	ret = page_pool_unref_page(page, 1);
+	if (ret) {
+		pr_warn("TRB put path=stack page_ix=%u ref_after=%ld to_free_ring=0\n",
+			page_ix, ret);
+		return true;
+	}
+
+	if (!trb_free_ring_return(page, page_ix)) {
+		pr_warn("TRB put path=stack page_ix=%u ref_after=0 to_free_ring=1\n",
+			page_ix);
+		return true;
+	}
+
+	pr_warn("TRB put path=stack page_ix=%u ref_after=0 to_free_ring=0\n",
+		page_ix);
+
+	page_pool_put_unrefed_page(pool, page, -1, false);
+	return true;
+}
+#endif
+
 static bool skb_pp_recycle(struct sk_buff *skb, void *data)
 {
 	if (!IS_ENABLED(CONFIG_PAGE_POOL) || !skb->pp_recycle)
@@ -1091,6 +1127,11 @@ static void skb_free_head(struct sk_buff *skb)
 	unsigned char *head = skb->head;
 
 	if (skb->head_frag) {
+#ifdef CONFIG_TRB_RX_RING_DEV
+		if (skb->trb_pkt && skb->pp_recycle &&
+		    skb_trb_pp_put_page(virt_to_page(head), skb->trb_head_page_ix))
+			return;
+#endif
 		if (skb_pp_recycle(skb, head))
 			return;
 		skb_free_frag(head);
@@ -1115,8 +1156,15 @@ static void skb_release_data(struct sk_buff *skb, enum skb_drop_reason reason)
 			goto free_head;
 	}
 
-	for (i = 0; i < shinfo->nr_frags; i++)
+	for (i = 0; i < shinfo->nr_frags; i++) {
+#ifdef CONFIG_TRB_RX_RING_DEV
+		if (skb->trb_pkt && skb->pp_recycle &&
+		    skb_trb_pp_put_page(skb_frag_page(&shinfo->frags[i]),
+					shinfo->trb_page_ix[i]))
+			continue;
+#endif
 		__skb_frag_unref(&shinfo->frags[i], skb->pp_recycle);
+	}
 
 free_head:
 	if (shinfo->frag_list)
@@ -1185,6 +1233,12 @@ void skb_release_head_state(struct sk_buff *skb)
 /* Free everything but the sk_buff shell. */
 static void skb_release_all(struct sk_buff *skb, enum skb_drop_reason reason)
 {
+#ifdef CONFIG_TRB_RX_RING_DEV
+	if (skb->trb_pkt)
+		pr_warn("TRB skb free: skb=%px users=%d active_ext=%u ext=%px trb_pkt=%u trb_head_ix=%u\n",
+			skb, refcount_read(&skb->users), skb->active_extensions,
+			skb->extensions, skb->trb_pkt, skb->trb_head_page_ix);
+#endif
 	skb_release_head_state(skb);
 	if (likely(skb->head))
 		skb_release_data(skb, reason);
@@ -6060,6 +6114,10 @@ bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
 
 		skb_fill_page_desc(to, to_shinfo->nr_frags,
 				   page, offset, skb_headlen(from));
+#ifdef CONFIG_TRB_RX_RING_DEV
+        pr_warn("Coalescing trb_idx %u \n", from->trb_head_page_ix);
+		to_shinfo->trb_page_ix[to_shinfo->nr_frags] = from->trb_head_page_ix;
+#endif
 		*fragstolen = true;
 	} else {
 		if (to_shinfo->nr_frags +
@@ -6074,6 +6132,11 @@ bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
 	memcpy(to_shinfo->frags + to_shinfo->nr_frags,
 	       from_shinfo->frags,
 	       from_shinfo->nr_frags * sizeof(skb_frag_t));
+#ifdef CONFIG_TRB_RX_RING_DEV
+	memcpy(to_shinfo->trb_page_ix + to_shinfo->nr_frags,
+	       from_shinfo->trb_page_ix,
+	       from_shinfo->nr_frags * sizeof(to_shinfo->trb_page_ix[0]));
+#endif
 	to_shinfo->nr_frags += from_shinfo->nr_frags;
 
 	if (!skb_cloned(from))
@@ -7083,6 +7146,7 @@ void __skb_ext_put(struct skb_ext *ext)
 	/* If this is last clone, nothing can increment
 	 * it after check passes.  Avoids one atomic op.
 	 */
+    pr_warn("SKB EXT OUT BUG PLACE 1\n");
 	if (refcount_read(&ext->refcnt) == 1)
 		goto free_now;
 
@@ -7090,6 +7154,7 @@ void __skb_ext_put(struct skb_ext *ext)
 		return;
 free_now:
 #ifdef CONFIG_XFRM
+    pr_warn("SKB EXT OUT BUG PLACE 2\n");
 	if (__skb_ext_exist(ext, SKB_EXT_SEC_PATH))
 		skb_ext_put_sp(skb_ext_get_ptr(ext, SKB_EXT_SEC_PATH));
 #endif
@@ -7097,6 +7162,7 @@ free_now:
 	if (__skb_ext_exist(ext, SKB_EXT_MCTP))
 		skb_ext_put_mctp(skb_ext_get_ptr(ext, SKB_EXT_MCTP));
 #endif
+    pr_warn("SKB EXT OUT BUG PLACE 3\n");
 
 	kmem_cache_free(skbuff_ext_cache, ext);
 }
