@@ -13,8 +13,10 @@
 #include <net/page_pool/helpers.h>
 #include <net/netmem.h>
 #include <net/tcp.h>
+#include <net/trb.h>
 #include <linux/poison.h>
 #include <linux/highmem.h>
+#include <linux/mutex.h>
 
 #define META_PAGES 3
 #define VM_TOTAL_PAGES 256
@@ -92,9 +94,15 @@ struct buf_map_entry {
 	__u32 inflight;
 };
 
+struct queue_ctx;
+
 struct trb_dev {
     
     struct miscdevice misc;
+    u16 total_qs;
+    u16 qctx_cap;
+    struct queue_ctx **qctx_by_rq;
+    struct mutex qctx_lock;
 
     /* Vmalloc-ed meta region holding, hdr, desc, and recycle ring */
     void *meta_base;
@@ -112,8 +120,17 @@ struct trb_dev {
 };
 
 struct queue_ctx {
-    struct trb_dev *dev;
-    struct eventfd_ctx *efd;
+	struct trb_dev *dev;
+	struct eventfd_ctx *efd;
+	u16 qid;
+
+	/* Per-queue datapath state (currently not wired; shape only). */
+	struct rx_ring_hdr *hdr;
+	struct trb_desc *rx_desc;
+	struct recycle_ring *rr;
+	struct trb_free_ring *free_ring;
+	struct buf_map_entry *bufs;
+	u32 buf_cap;
 };
 
 struct trb_dev *rx_dev;
@@ -121,11 +138,83 @@ static bool trb_dev_ready;
 
 struct queue_ctx *q;
 
-/* Exported TRB helpers */
-struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size);
-int trb_tcp_queue_skb(struct sock *sk, struct sk_buff *skb);
-struct page *trb_page_pool_alloc(u32 *idx);
-int trb_free_ring_return(struct page *page, u32 idx);
+static int trb_qctx_track_add(struct trb_dev *dev, u16 qid,
+			      struct queue_ctx *ctx)
+{
+	struct queue_ctx **new_table;
+	u16 new_cap;
+
+	if (!dev || !ctx)
+		return -EINVAL;
+
+	mutex_lock(&dev->qctx_lock);
+	if (qid >= dev->qctx_cap) {
+		new_cap = dev->qctx_cap ? dev->qctx_cap : 1;
+		while (new_cap <= qid)
+			new_cap <<= 1;
+
+		new_table = krealloc_array(dev->qctx_by_rq, new_cap,
+					   sizeof(*new_table), GFP_KERNEL);
+		if (!new_table) {
+			mutex_unlock(&dev->qctx_lock);
+			return -ENOMEM;
+		}
+
+		memset(new_table + dev->qctx_cap, 0,
+		       (new_cap - dev->qctx_cap) * sizeof(*new_table));
+		dev->qctx_by_rq = new_table;
+		dev->qctx_cap = new_cap;
+	}
+
+	if (dev->qctx_by_rq[qid]) {
+		mutex_unlock(&dev->qctx_lock);
+		return -EEXIST;
+	}
+
+	dev->qctx_by_rq[qid] = ctx;
+	dev->total_qs++;
+	mutex_unlock(&dev->qctx_lock);
+	return 0;
+}
+
+static void trb_qctx_track_del(struct trb_dev *dev, u16 qid)
+{
+	if (!dev)
+		return;
+
+	mutex_lock(&dev->qctx_lock);
+	if (dev->qctx_by_rq && qid < dev->qctx_cap && dev->qctx_by_rq[qid]) {
+		dev->qctx_by_rq[qid] = NULL;
+		if (dev->total_qs)
+			dev->total_qs--;
+	}
+	mutex_unlock(&dev->qctx_lock);
+}
+
+void trb_unregister_qctx(struct queue_ctx *qctx)
+{
+	struct trb_dev *dev;
+	u16 qid;
+
+	if (!qctx || !qctx->dev)
+		return;
+
+	dev = qctx->dev;
+	qid = qctx->qid;
+
+	mutex_lock(&dev->qctx_lock);
+	if (dev->qctx_by_rq && qid < dev->qctx_cap &&
+	    dev->qctx_by_rq[qid] == qctx) {
+		dev->qctx_by_rq[qid] = NULL;
+		if (dev->total_qs)
+			dev->total_qs--;
+	}
+	mutex_unlock(&dev->qctx_lock);
+
+	kfree(qctx);
+}
+EXPORT_SYMBOL_GPL(trb_unregister_qctx);
+
 static int build_meta_and_userspace_pool(struct trb_dev *d);
 
 static int trb_prepare_dev(void)
@@ -135,16 +224,12 @@ static int trb_prepare_dev(void)
 	if (trb_dev_ready)
 		return 0;
 
-	rx_dev = kzalloc(sizeof(struct trb_dev), GFP_KERNEL);
 	if (!rx_dev)
-		return -ENOMEM;
+		return -ENODEV;
 
 	ret = build_meta_and_userspace_pool(rx_dev);
-	if (ret) {
-		kfree(rx_dev);
-		rx_dev = NULL;
+	if (ret)
 		return ret;
-	}
 
 	trb_dev_ready = true;
 	return 0;
@@ -173,7 +258,7 @@ static int trb_mmap(struct file *file, struct vm_area_struct *vma)
             return ret;
     }
     uaddr = vma->vm_start + d->hdr->pool_off;
-    pr_warn("MMAPPING %u pages\n", pool_pages);
+    pr_warn("MMAPPING %lu pages\n", pool_pages);
     for (i = 0; i < pool_pages; i++, uaddr += PAGE_SIZE) {
         pg = d->pages[i];
         ret = vm_insert_page(vma, uaddr, pg);
@@ -249,9 +334,11 @@ static void drain_rr(struct recycle_ring *rr)
 	}
 }
 /* This should also obviously take a queue context when hooked up with multiple cores */
-struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size)
+struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size,
+				  u16 rq_ix, struct queue_ctx **out_qctx)
 {
 	struct trb_dev *dev;
+	struct queue_ctx *ctx;
 	struct rx_ring_hdr *hdr;
 	struct page_pool *pool;
 	struct trb_free_ring *free_ring = NULL;
@@ -263,8 +350,9 @@ struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size)
 	unsigned long page_bytes;
 	int err = -EINVAL;
 
-	if (!pp || !buf_size)
+	if (!pp || !buf_size || !out_qctx)
 		return ERR_PTR(-EINVAL);
+	*out_qctx = NULL;
 
 	if (!trb_dev_ready) {
 		int ret = trb_prepare_dev();
@@ -274,10 +362,22 @@ struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size)
 
 	dev = rx_dev;
 	hdr = dev->hdr;
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return ERR_PTR(-ENOMEM);
+	ctx->dev = dev;
+	ctx->qid = rq_ix;
+	err = trb_qctx_track_add(dev, rq_ix, ctx);
+	if (err) {
+		kfree(ctx);
+		return ERR_PTR(err);
+	}
 
 	pool = page_pool_create(pp);
-	if (IS_ERR(pool))
-		return pool;
+	if (IS_ERR(pool)) {
+		err = PTR_ERR(pool);
+		goto err_free_ctx;
+	}
 
 	page_bytes = PAGE_SIZE << pp->order;
 	bufs_per_page = DIV_ROUND_UP(page_bytes, buf_size);
@@ -335,6 +435,7 @@ struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size)
 	hdr->buf_size = buf_size;
 	hdr->buf_cap = total_bufs;
 	hdr->pool_size = (__u64)total_bufs * buf_size;
+	*out_qctx = ctx;
 
 	return pool;
 
@@ -353,6 +454,9 @@ err_free_pages:
 	dev->pages = NULL;
 err_destroy_pool:
 	page_pool_destroy(pool);
+err_free_ctx:
+	trb_qctx_track_del(dev, rq_ix);
+	kfree(ctx);
 	dev->pp = NULL;
 	return ERR_PTR(err);
 }
@@ -545,6 +649,7 @@ static int __init trb_init(void)
     rx_dev = kzalloc(sizeof(struct trb_dev), GFP_KERNEL);
     if (!rx_dev)
         return -ENOMEM;
+    mutex_init(&rx_dev->qctx_lock);
 
     rx_dev->misc.minor = MISC_DYNAMIC_MINOR;
     rx_dev->misc.name = "trb_dev";
@@ -835,6 +940,12 @@ static void __exit trb_exit(void)
     if (rx_dev) {
         misc_deregister(&rx_dev->misc);
         if (trb_dev_ready) {
+            if (rx_dev->qctx_by_rq) {
+                for (i = 0; i < rx_dev->qctx_cap; i++)
+                    kfree(rx_dev->qctx_by_rq[i]);
+                kfree(rx_dev->qctx_by_rq);
+                rx_dev->qctx_by_rq = NULL;
+            }
             if (rx_dev->bufs) {
                 for (i = 0; i < rx_dev->hdr->buf_cap; i++) {
                     if (rx_dev->bufs[i].page)

@@ -64,6 +64,7 @@
 
 extern const struct net_device_ops mlx5e_netdev_ops;
 struct page_pool;
+struct queue_ctx;
 
 #define MLX5E_METADATA_ETHER_TYPE (0x8CE4)
 #define MLX5E_METADATA_ETHER_LEN 8
@@ -718,6 +719,7 @@ struct mlx5e_rq {
 	struct mlx5e_xdpsq    *xdpsq;
 	DECLARE_BITMAP(flags, 8);
 	struct page_pool      *page_pool;
+	struct queue_ctx      *trb_qctx;
 
 	/* AF_XDP zero-copy */
 	struct xsk_buff_pool  *xsk_pool;

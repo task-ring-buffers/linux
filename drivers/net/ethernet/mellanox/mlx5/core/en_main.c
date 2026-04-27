@@ -942,10 +942,13 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 		 * required state to clear. And page_pool gracefully handle
 		 * elevated refcnt.
 		 */
-        if (params->trb_enabled && rq->ix != 0)
-            rq->page_pool = trb_register_pp(&pp_params, rq->buff.frame0_sz);
-        else
-		    rq->page_pool = page_pool_create(&pp_params);
+		rq->trb_qctx = NULL;
+		if (params->trb_enabled && rq->ix != 0)
+			rq->page_pool = trb_register_pp(&pp_params,
+							rq->buff.frame0_sz,
+							rq->ix, &rq->trb_qctx);
+		else
+			rq->page_pool = page_pool_create(&pp_params);
 		if (IS_ERR(rq->page_pool)) {
 			err = PTR_ERR(rq->page_pool);
 			rq->page_pool = NULL;
@@ -997,6 +1000,10 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 
 err_destroy_page_pool:
 	page_pool_destroy(rq->page_pool);
+	if (rq->trb_qctx) {
+		trb_unregister_qctx(rq->trb_qctx);
+		rq->trb_qctx = NULL;
+	}
 err_free_by_rq_type:
 	switch (rq->wq_type) {
 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
@@ -1024,6 +1031,10 @@ static void mlx5e_free_rq(struct mlx5e_rq *rq)
 {
 	kvfree(rq->dim);
 	page_pool_destroy(rq->page_pool);
+	if (rq->trb_qctx) {
+		trb_unregister_qctx(rq->trb_qctx);
+		rq->trb_qctx = NULL;
+	}
 
 	switch (rq->wq_type) {
 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
