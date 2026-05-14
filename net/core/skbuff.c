@@ -1044,7 +1044,7 @@ EXPORT_SYMBOL(napi_pp_put_page);
 #endif
 
 #ifdef CONFIG_TRB_RX_RING_DEV
-static bool skb_trb_pp_put_page(struct page *page, u32 page_ix)
+static bool skb_trb_pp_put_page(struct queue_ctx *qctx, struct page *page, u32 page_ix)
 {
 	netmem_ref netmem = page_to_netmem(page);
 	struct page_pool *pool;
@@ -1062,7 +1062,7 @@ static bool skb_trb_pp_put_page(struct page *page, u32 page_ix)
 		return true;
 	}
 
-	if (!trb_free_ring_return(page, page_ix)) {
+	if (!trb_free_ring_return_ctx(qctx, page, page_ix)) {
 		pr_warn("TRB put path=stack page_ix=%u ref_after=0 to_free_ring=1\n",
 			page_ix);
 		return true;
@@ -1129,7 +1129,8 @@ static void skb_free_head(struct sk_buff *skb)
 	if (skb->head_frag) {
 #ifdef CONFIG_TRB_RX_RING_DEV
 		if (skb->trb_pkt && skb->pp_recycle &&
-		    skb_trb_pp_put_page(virt_to_page(head), skb->trb_head_page_ix))
+		    skb_trb_pp_put_page(skb->trb_qctx, virt_to_page(head),
+					skb->trb_head_page_ix))
 			return;
 #endif
 		if (skb_pp_recycle(skb, head))
@@ -1159,7 +1160,8 @@ static void skb_release_data(struct sk_buff *skb, enum skb_drop_reason reason)
 	for (i = 0; i < shinfo->nr_frags; i++) {
 #ifdef CONFIG_TRB_RX_RING_DEV
 		if (skb->trb_pkt && skb->pp_recycle &&
-		    skb_trb_pp_put_page(skb_frag_page(&shinfo->frags[i]),
+		    skb_trb_pp_put_page(skb->trb_qctx,
+					skb_frag_page(&shinfo->frags[i]),
 					shinfo->trb_page_ix[i]))
 			continue;
 #endif

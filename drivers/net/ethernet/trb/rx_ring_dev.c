@@ -9,14 +9,17 @@
 #include <linux/eventfd.h>
 #include <linux/vmalloc.h>
 #include <linux/init.h>
+#include <linux/netdevice.h>
 #include <net/page_pool/types.h>
 #include <net/page_pool/helpers.h>
 #include <net/netmem.h>
+#include <net/net_namespace.h>
 #include <net/tcp.h>
 #include <net/trb.h>
 #include <linux/poison.h>
 #include <linux/highmem.h>
 #include <linux/mutex.h>
+#include <linux/list.h>
 
 #define META_PAGES 3
 #define VM_TOTAL_PAGES 256
@@ -30,39 +33,59 @@
 #define BUF_SIZE PAGE_SIZE
 
 
-#define IOCTL_REGISTER_EFD _IOW('m', 1, int)
+struct trb_efd_req {
+	__u16 qid;
+	__u16 reserved;
+	__s32 efd_fd;
+};
+
+#define IOCTL_REGISTER_EFD _IOW('m', 1, struct trb_efd_req)
 
 #define IOCTL_TEST_PRODUCE _IOW('m', 2, u32)
+#define IOCTL_SET_NUM_QS _IOW('m', 3, __u16)
+#define IOCTL_TRB_CONFIG _IOW('m', 4, struct trb_cfg_req)
+
+struct trb_cfg_req {
+	char ifname[IFNAMSIZ];
+	__u16 num_qs;
+	__u16 dport;
+	__u8 enable;
+	__u8 fs_type;
+	__u16 reserved;
+};
+
+extern int mlx5e_trb_configure(struct net_device *netdev, bool enable,
+			       unsigned int num_channels, u8 trb_fs_type,
+			       u16 trb_dport, struct trb_dev *trb_dev);
+
+struct rx_hdr_qoff {
+	__u64 desc_off;
+	__u64 rr_off;
+	__u64 pool_off;
+};
 
 struct rx_ring_hdr {
-    /* RX descriptor ring indices (SPSC):
-     *  - prod: written by KERNEL (store-release)
-     *  - con: written by USER (store-release)
-     *  Consumer read counterparts with load-acquire before dereferencing */
-    __u32 prod;
-    __u32 con;
-
-    /* Total payload bytes mapped */
-    __u64 pool_size;
-
-    /* Byte offsets from the beginning of the mapping to each region */
-    __u64 pool_off;     /* Payload starts here */
-    __u64 desc_off;     /* Descriptors start here */
-    __u64 rr_off;     /* fill ring hdr */
-
-    __u32 buf_cap;
-    __u32 desc_cap;
-    __u32 fill_cap;
-    __u32 buf_size;
-    
-    __u32 doorbell;
+	__u16 num_qs;
+	__u16 reserved;
+	__u32 doorbell;
+	struct rx_hdr_qoff q[];
 };
 
 struct trb_desc {
-    __u32 buf_id; /* index into payload buffers (0 ... buf_cap - 1) */
-    __u32 len;    /* valid bytes starting at off */
-    __u32 off;    /* byte offset within the buffer */
-    __u32 flags;  /* future use */
+	__u32 buf_id; /* index into payload buffers (0 ... buf_cap - 1) */
+	__u32 len;    /* valid bytes starting at off */
+	__u32 off;    /* byte offset within the buffer */
+	__u32 flags;  /* future use */
+};
+
+struct descriptor_ring {
+	__u32 prod;
+	__u32 con;
+	__u32 desc_cap;
+	__u64 pool_size;
+	__u32 buf_cap;
+	__u32 buf_size;
+	struct trb_desc descs[];
 };
 
 struct recycle_ring {
@@ -104,18 +127,16 @@ struct trb_dev {
     struct queue_ctx **qctx_by_rq;
     struct mutex qctx_lock;
 
-    /* Vmalloc-ed meta region holding, hdr, desc, and recycle ring */
+    /* Vmalloc-ed meta root + per-queue ring pointer tables */
     void *meta_base;
     size_t meta_bytes;
     struct rx_ring_hdr *hdr;
-    struct trb_desc *rx_desc;
-    struct recycle_ring *rr;
+    struct descriptor_ring **dr_by_qid;
+    struct recycle_ring **rr_by_qid;
+	atomic_t mmap_cnt;
+	struct list_head pending_qctx;
 
     /* Payload backing via page_pool */
-    struct page_pool *pp;
-    struct buf_map_entry *bufs;
-    struct page **pages;
-    struct trb_free_ring *free_ring;
 
 };
 
@@ -123,47 +144,115 @@ struct queue_ctx {
 	struct trb_dev *dev;
 	struct eventfd_ctx *efd;
 	u16 qid;
+	struct list_head pending_node;
+	bool pending_free;
 
 	/* Per-queue datapath state (currently not wired; shape only). */
-	struct rx_ring_hdr *hdr;
-	struct trb_desc *rx_desc;
+	struct descriptor_ring *dr;
 	struct recycle_ring *rr;
 	struct trb_free_ring *free_ring;
+	struct page_pool *pp;
+	struct page **pages;
 	struct buf_map_entry *bufs;
-	u32 buf_cap;
 };
 
-struct trb_dev *rx_dev;
 static bool trb_dev_ready;
+static int build_meta_and_userspace_pool(struct trb_dev *d);
 
-struct queue_ctx *q;
+static void trb_qctx_free(struct queue_ctx *qctx)
+{
+	u32 i;
+
+	if (!qctx)
+		return;
+
+	if (qctx->efd)
+		eventfd_ctx_put(qctx->efd);
+
+	if (qctx->pages && qctx->pp && qctx->free_ring) {
+		for (i = 0; i < qctx->free_ring->cap; i++) {
+			if (qctx->pages[i])
+				page_pool_put_page(qctx->pp, qctx->pages[i], 0, true);
+		}
+	}
+
+	kfree(qctx->bufs);
+	kfree(qctx->pages);
+	kvfree(qctx->free_ring);
+	if (qctx->pp)
+		page_pool_destroy(qctx->pp);
+	kfree(qctx);
+}
+
+static void trb_dev_destroy(struct trb_dev *dev)
+{
+	struct queue_ctx *qctx, *tmp;
+
+	if (!dev)
+		return;
+
+	list_for_each_entry_safe(qctx, tmp, &dev->pending_qctx, pending_node) {
+		list_del_init(&qctx->pending_node);
+		trb_qctx_free(qctx);
+	}
+	kfree(dev->qctx_by_rq);
+
+	kfree(dev->dr_by_qid);
+	kfree(dev->rr_by_qid);
+	vfree(dev->meta_base);
+	kfree(dev);
+}
+
+static int trb_set_num_qs(struct trb_dev *dev, __u16 nqs)
+{
+	struct queue_ctx **tbl;
+	int ret;
+
+	if (!dev || !nqs)
+		return -EINVAL;
+
+	mutex_lock(&dev->qctx_lock);
+	if (dev->qctx_by_rq) {
+		mutex_unlock(&dev->qctx_lock);
+		return -EBUSY;
+	}
+
+	tbl = kcalloc(nqs, sizeof(*tbl), GFP_KERNEL);
+	if (!tbl) {
+		mutex_unlock(&dev->qctx_lock);
+		return -ENOMEM;
+	}
+
+	dev->qctx_by_rq = tbl;
+	dev->qctx_cap = nqs;
+	dev->total_qs = 0;
+	mutex_unlock(&dev->qctx_lock);
+
+	ret = build_meta_and_userspace_pool(dev);
+	if (ret) {
+		mutex_lock(&dev->qctx_lock);
+		kfree(dev->qctx_by_rq);
+		dev->qctx_by_rq = NULL;
+		dev->qctx_cap = 0;
+		dev->total_qs = 0;
+		mutex_unlock(&dev->qctx_lock);
+		return ret;
+	}
+
+	trb_dev_ready = true;
+	return 0;
+}
 
 static int trb_qctx_track_add(struct trb_dev *dev, u16 qid,
 			      struct queue_ctx *ctx)
 {
-	struct queue_ctx **new_table;
-	u16 new_cap;
-
 	if (!dev || !ctx)
 		return -EINVAL;
 
 	mutex_lock(&dev->qctx_lock);
-	if (qid >= dev->qctx_cap) {
-		new_cap = dev->qctx_cap ? dev->qctx_cap : 1;
-		while (new_cap <= qid)
-			new_cap <<= 1;
-
-		new_table = krealloc_array(dev->qctx_by_rq, new_cap,
-					   sizeof(*new_table), GFP_KERNEL);
-		if (!new_table) {
-			mutex_unlock(&dev->qctx_lock);
-			return -ENOMEM;
-		}
-
-		memset(new_table + dev->qctx_cap, 0,
-		       (new_cap - dev->qctx_cap) * sizeof(*new_table));
-		dev->qctx_by_rq = new_table;
-		dev->qctx_cap = new_cap;
+	if (!dev->qctx_by_rq || qid >= dev->qctx_cap) {
+		mutex_unlock(&dev->qctx_lock);
+		return -ERANGE;
 	}
 
 	if (dev->qctx_by_rq[qid]) {
@@ -194,79 +283,144 @@ static void trb_qctx_track_del(struct trb_dev *dev, u16 qid)
 void trb_unregister_qctx(struct queue_ctx *qctx)
 {
 	struct trb_dev *dev;
-	u16 qid;
+	u16 qid, idx;
 
 	if (!qctx || !qctx->dev)
 		return;
 
 	dev = qctx->dev;
 	qid = qctx->qid;
+	if (!qid)
+		goto out_free;
+	idx = qid - 1;
 
 	mutex_lock(&dev->qctx_lock);
-	if (dev->qctx_by_rq && qid < dev->qctx_cap &&
-	    dev->qctx_by_rq[qid] == qctx) {
-		dev->qctx_by_rq[qid] = NULL;
+	if (dev->qctx_by_rq && idx < dev->qctx_cap &&
+	    dev->qctx_by_rq[idx] == qctx) {
+		dev->qctx_by_rq[idx] = NULL;
 		if (dev->total_qs)
 			dev->total_qs--;
 	}
 	mutex_unlock(&dev->qctx_lock);
 
-	kfree(qctx);
+out_free:
+	mutex_lock(&dev->qctx_lock);
+	if (atomic_read(&dev->mmap_cnt) > 0) {
+		if (!qctx->pending_free) {
+			qctx->pending_free = true;
+			list_add_tail(&qctx->pending_node, &dev->pending_qctx);
+		}
+		mutex_unlock(&dev->qctx_lock);
+		return;
+	}
+	mutex_unlock(&dev->qctx_lock);
+
+	trb_qctx_free(qctx);
 }
 EXPORT_SYMBOL_GPL(trb_unregister_qctx);
 
 static int build_meta_and_userspace_pool(struct trb_dev *d);
 
-static int trb_prepare_dev(void)
+static void trb_vm_close(struct vm_area_struct *vma)
 {
-	int ret;
+	struct trb_dev *dev = vma->vm_private_data;
+	struct queue_ctx *qctx, *tmp;
 
-	if (trb_dev_ready)
-		return 0;
+	if (!dev)
+		return;
+	if (atomic_dec_return(&dev->mmap_cnt) != 0)
+		return;
 
-	if (!rx_dev)
-		return -ENODEV;
-
-	ret = build_meta_and_userspace_pool(rx_dev);
-	if (ret)
-		return ret;
-
-	trb_dev_ready = true;
-	return 0;
+	mutex_lock(&dev->qctx_lock);
+	list_for_each_entry_safe(qctx, tmp, &dev->pending_qctx, pending_node) {
+		list_del_init(&qctx->pending_node);
+		mutex_unlock(&dev->qctx_lock);
+		trb_qctx_free(qctx);
+		mutex_lock(&dev->qctx_lock);
+	}
+	mutex_unlock(&dev->qctx_lock);
 }
+
+static const struct vm_operations_struct trb_vm_ops = {
+	.close = trb_vm_close,
+};
 
 static int trb_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	struct queue_ctx *q = file->private_data;
-	struct trb_dev *d = q->dev;
+	struct trb_dev *d = file->private_data;
 	unsigned long len = vma->vm_end - vma->vm_start;
-    unsigned long need = d->hdr->pool_off + (unsigned long)d->hdr->buf_cap * BUF_SIZE;
-    unsigned long pool_pages = DIV_ROUND_UP((unsigned long)d->hdr->pool_size, PAGE_SIZE);
-    unsigned long uaddr;
-    struct page *pg;
-    int i, ret;
-    int off = 0;
-    
-    if (len < need)
-        return -EINVAL;
-    for (off = 0; off < d->meta_bytes ; off += PAGE_SIZE) {
-        pg = vmalloc_to_page((__u8*)d->meta_base + off);
-        if (!pg)
-            return -EFAULT;
-        ret = vm_insert_page(vma, vma->vm_start + off, pg);
-        if (ret)
-            return ret;
-    }
-    uaddr = vma->vm_start + d->hdr->pool_off;
-    pr_warn("MMAPPING %lu pages\n", pool_pages);
-    for (i = 0; i < pool_pages; i++, uaddr += PAGE_SIZE) {
-        pg = d->pages[i];
-        ret = vm_insert_page(vma, uaddr, pg);
-        if (ret)
-            return ret;
-    }
+	unsigned long need;
+	unsigned long off;
+	struct page *pg;
+	u16 qid;
+	int ret;
 
-    return 0;
+	if (!d || !d->meta_base || !d->hdr)
+		return -ENODEV;
+	vma->vm_ops = &trb_vm_ops;
+	vma->vm_private_data = d;
+	atomic_inc(&d->mmap_cnt);
+
+	need = d->meta_bytes;
+	mutex_lock(&d->qctx_lock);
+	if (d->qctx_by_rq) {
+		for (qid = 0; qid < d->qctx_cap; qid++) {
+			struct queue_ctx *qctx = d->qctx_by_rq[qid];
+			unsigned long qneed;
+
+			if (!qctx || !qctx->free_ring)
+				continue;
+
+			qneed = d->hdr->q[qid].pool_off +
+				(unsigned long)qctx->free_ring->cap * PAGE_SIZE;
+			if (qneed > need)
+				need = qneed;
+		}
+	}
+	mutex_unlock(&d->qctx_lock);
+
+	if (len < need)
+		return -EINVAL;
+
+	for (off = 0; off < d->meta_bytes; off += PAGE_SIZE) {
+		pg = vmalloc_to_page((u8 *)d->meta_base + off);
+		if (!pg)
+			return -EFAULT;
+
+		ret = vm_insert_page(vma, vma->vm_start + off, pg);
+		if (ret)
+			return ret;
+	}
+
+	mutex_lock(&d->qctx_lock);
+	if (d->qctx_by_rq) {
+		for (qid = 0; qid < d->qctx_cap; qid++) {
+			struct queue_ctx *qctx = d->qctx_by_rq[qid];
+			unsigned long uaddr;
+			u32 i;
+
+			if (!qctx || !qctx->pages || !qctx->free_ring)
+				continue;
+
+			uaddr = vma->vm_start + d->hdr->q[qid].pool_off;
+			for (i = 0; i < qctx->free_ring->cap; i++, uaddr += PAGE_SIZE) {
+				pg = qctx->pages[i];
+				if (!pg) {
+					mutex_unlock(&d->qctx_lock);
+					return -EFAULT;
+				}
+
+				ret = vm_insert_page(vma, uaddr, pg);
+				if (ret) {
+					mutex_unlock(&d->qctx_lock);
+					return ret;
+				}
+			}
+		}
+	}
+	mutex_unlock(&d->qctx_lock);
+
+	return 0;
 }
 
 static inline bool rr_pop(struct recycle_ring *rr, __u32 *out)
@@ -291,10 +445,37 @@ static inline void rr_push(struct recycle_ring *rr, __u32 v)
     smp_store_release(&rr->prod, prod + 1);
 }
 
-static inline void trb_buf_put_page(struct trb_dev *dev, __u32 buf_id)
+int trb_free_ring_return_ctx(struct queue_ctx *qctx,
+			     struct page *page, __u32 idx)
 {
-	struct buf_map_entry *b = &dev->bufs[buf_id];
+	struct trb_free_ring *ring;
+	struct trb_free_entry *entry;
+	u32 prod;
+
+	if (!qctx || !qctx->free_ring || !page)
+		return -EINVAL;
+
+	ring = qctx->free_ring;
+	prod = READ_ONCE(ring->prod);
+	if (prod - READ_ONCE(ring->con) >= ring->cap)
+		return -ENOSPC;
+
+	entry = &ring->entries[prod & (ring->cap - 1)];
+	entry->page = page;
+	entry->page_ix = idx;
+	smp_store_release(&ring->prod, prod + 1);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(trb_free_ring_return_ctx);
+
+static inline void trb_buf_put_page(struct queue_ctx *qctx, __u32 buf_id)
+{
+	struct buf_map_entry *b;
 	long ret;
+
+	if (!qctx || !qctx->bufs || !qctx->pp)
+		return;
+	b = &qctx->bufs[buf_id];
 
 	ret = page_pool_unref_page(b->page, 1);
 	if (ret) {
@@ -303,7 +484,7 @@ static inline void trb_buf_put_page(struct trb_dev *dev, __u32 buf_id)
 		return;
 	}
 
-	if (!trb_free_ring_return(b->page, b->page_ix)) {
+	if (!trb_free_ring_return_ctx(qctx, b->page, b->page_ix)) {
 		pr_warn("TRB put path=drain_rr page_ix=%u ref_after=0 to_free_ring=1\n",
 			b->page_ix);
 		return;
@@ -311,42 +492,49 @@ static inline void trb_buf_put_page(struct trb_dev *dev, __u32 buf_id)
 
 	pr_warn("TRB put path=drain_rr page_ix=%u ref_after=0 to_free_ring=0\n",
 		b->page_ix);
-	page_pool_put_unrefed_page(dev->pp, b->page, -1, false);
+	page_pool_put_unrefed_page(qctx->pp, b->page, -1, false);
 }
 
 /* Placeholder: assume userspace provides buf_ids to recycle */
-static void drain_rr(struct recycle_ring *rr)
+static void drain_rr(struct queue_ctx *qctx)
 {
-	struct trb_dev *dev = rx_dev;
+	struct recycle_ring *rr;
+	struct descriptor_ring *dr;
 	__u32 buf_id;
 
-	if (!dev || !rr)
+	if (!qctx)
+		return;
+	rr = qctx->rr;
+	dr = qctx->dr;
+
+	if (!rr || !dr || !qctx->bufs)
 		return;
 
 	while (rr_pop(rr, &buf_id)) {
-		if (buf_id >= dev->hdr->buf_cap)
+		if (buf_id >= dr->buf_cap)
 			continue;
-		if (!dev->bufs[buf_id].inflight)
+		if (!qctx->bufs[buf_id].inflight)
 			continue;
 
-		dev->bufs[buf_id].inflight--;
-		trb_buf_put_page(dev, buf_id);
+		qctx->bufs[buf_id].inflight--;
+		trb_buf_put_page(qctx, buf_id);
 	}
 }
 /* This should also obviously take a queue context when hooked up with multiple cores */
 struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size,
-				  u16 rq_ix, struct queue_ctx **out_qctx)
+				  u16 rq_ix, struct trb_dev *dev,
+				  struct queue_ctx **out_qctx)
 {
-	struct trb_dev *dev;
 	struct queue_ctx *ctx;
-	struct rx_ring_hdr *hdr;
+	struct descriptor_ring *dr;
+	u16 qidx;
 	struct page_pool *pool;
 	struct trb_free_ring *free_ring = NULL;
 	struct page *pg;
 	size_t bufs_per_page;
 	size_t total_bufs;
 	size_t free_ring_bytes;
-	size_t i, j, idx;
+	size_t i, j, bidx;
 	unsigned long page_bytes;
 	int err = -EINVAL;
 
@@ -354,20 +542,33 @@ struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size,
 		return ERR_PTR(-EINVAL);
 	*out_qctx = NULL;
 
-	if (!trb_dev_ready) {
-		int ret = trb_prepare_dev();
-		if (ret)
-			return ERR_PTR(ret);
-	}
+	if (!trb_dev_ready || !dev)
+		return ERR_PTR(-EINVAL);
+	if (!rq_ix)
+		return ERR_PTR(-EINVAL);
 
-	dev = rx_dev;
-	hdr = dev->hdr;
+	qidx = rq_ix - 1;
+
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
 		return ERR_PTR(-ENOMEM);
+
 	ctx->dev = dev;
+	ctx->efd = NULL;
 	ctx->qid = rq_ix;
-	err = trb_qctx_track_add(dev, rq_ix, ctx);
+	INIT_LIST_HEAD(&ctx->pending_node);
+	ctx->pending_free = false;
+	ctx->dr = (dev->dr_by_qid && qidx < dev->qctx_cap) ?
+		  dev->dr_by_qid[qidx] : NULL;
+	ctx->rr = (dev->rr_by_qid && qidx < dev->qctx_cap) ?
+		  dev->rr_by_qid[qidx] : NULL;
+	ctx->pp = NULL;
+	ctx->pages = NULL;
+	ctx->bufs = NULL;
+	ctx->free_ring = NULL;
+	if (!ctx->dr || !ctx->rr)
+		goto err_free_ctx_only;
+	err = trb_qctx_track_add(dev, qidx, ctx);
 	if (err) {
 		kfree(ctx);
 		return ERR_PTR(err);
@@ -383,16 +584,16 @@ struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size,
 	bufs_per_page = DIV_ROUND_UP(page_bytes, buf_size);
 	total_bufs = (size_t)pp->pool_size * bufs_per_page;
 
-	dev->pp = pool;
+	ctx->pp = pool;
 
-	dev->pages = kcalloc(pp->pool_size, sizeof(*dev->pages), GFP_KERNEL);
-	if (!dev->pages) {
+	ctx->pages = kcalloc(pp->pool_size, sizeof(*ctx->pages), GFP_KERNEL);
+	if (!ctx->pages) {
 		err = -ENOMEM;
 		goto err_destroy_pool;
 	}
 
-	dev->bufs = kcalloc(total_bufs, sizeof(*dev->bufs), GFP_KERNEL);
-	if (!dev->bufs) {
+	ctx->bufs = kcalloc(total_bufs, sizeof(*ctx->bufs), GFP_KERNEL);
+	if (!ctx->bufs) {
 		err = -ENOMEM;
 		goto err_free_pages;
 	}
@@ -404,16 +605,16 @@ struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size,
 			goto err_release_pages;
 		}
 
-		dev->pages[i] = pg;
+		ctx->pages[i] = pg;
 
-			for (j = 0; j < bufs_per_page; j++) {
-				idx = i * bufs_per_page + j;
-				dev->bufs[idx].page = pg;
-				dev->bufs[idx].dma_base = (dma_addr_t)(j * buf_size);
-				dev->bufs[idx].page_ix = i;
-				dev->bufs[idx].inflight = 0;
-			}
+		for (j = 0; j < bufs_per_page; j++) {
+			bidx = i * bufs_per_page + j;
+			ctx->bufs[bidx].page = pg;
+			ctx->bufs[bidx].dma_base = (dma_addr_t)(j * buf_size);
+			ctx->bufs[bidx].page_ix = i;
+			ctx->bufs[bidx].inflight = 0;
 		}
+	}
 
 	free_ring_bytes = struct_size(free_ring, entries, pp->pool_size);
 	free_ring = kvzalloc(free_ring_bytes, GFP_KERNEL);
@@ -426,88 +627,138 @@ struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size,
 	free_ring->prod = pp->pool_size;
 	free_ring->cap = pp->pool_size;
 	for (i = 0; i < pp->pool_size; i++) {
-		free_ring->entries[i].page = dev->pages[i];
+		free_ring->entries[i].page = ctx->pages[i];
 		free_ring->entries[i].page_ix = i;
 	}
-	kvfree(dev->free_ring);
-	dev->free_ring = free_ring;
+	ctx->free_ring = free_ring;
 
-	hdr->buf_size = buf_size;
-	hdr->buf_cap = total_bufs;
-	hdr->pool_size = (__u64)total_bufs * buf_size;
+	dr = ctx->dr;
+	WRITE_ONCE(dr->prod, 0);
+	WRITE_ONCE(dr->con, 0);
+	dr->buf_size = buf_size;
+	dr->buf_cap = total_bufs;
+	dr->pool_size = (__u64)total_bufs * buf_size;
 	*out_qctx = ctx;
 
 	return pool;
 
 err_release_pages:
 	while (i--) {
-		if (dev->pages[i]) {
-			page_pool_put_page(pool, dev->pages[i], 0, true);
-			dev->pages[i] = NULL;
+		if (ctx->pages[i]) {
+			page_pool_put_page(pool, ctx->pages[i], 0, true);
+			ctx->pages[i] = NULL;
 		}
 	}
 	kvfree(free_ring);
-	kfree(dev->bufs);
-	dev->bufs = NULL;
+	kfree(ctx->bufs);
+	ctx->bufs = NULL;
 err_free_pages:
-	kfree(dev->pages);
-	dev->pages = NULL;
+	kfree(ctx->pages);
+	ctx->pages = NULL;
 err_destroy_pool:
 	page_pool_destroy(pool);
 err_free_ctx:
-	trb_qctx_track_del(dev, rq_ix);
+	trb_qctx_track_del(dev, qidx);
 	kfree(ctx);
-	dev->pp = NULL;
 	return ERR_PTR(err);
+err_free_ctx_only:
+	kfree(ctx);
+	return ERR_PTR(-EINVAL);
 }
 
 static int build_meta_and_userspace_pool(struct trb_dev *d)
 {
-	size_t hdr_sz, desc_bytes, recycle_bytes, need_bytes, meta_bytes;
+	size_t hdr_sz, dr_bytes, rr_bytes, need_bytes, meta_bytes;
+	size_t dr_region_off, rr_region_off, pool_region_off;
 	struct rx_ring_hdr *hdr;
+	struct descriptor_ring *dr;
 	struct recycle_ring *rr;
-	struct trb_desc *rxds;
+	u16 nqs;
+	u16 qid;
 	void *base;
 
-	/* Layout (all inside meta_base):
-	 *   base + 0                     : struct rx_ring_hdr
-	 *   base + hdr_sz                : trb_desc[DESC_CAP]
-	 *   base + hdr_sz + desc_bytes   : struct recycle_ring + entries[FILL_CAP]
-	 *   meta_bytes (>= 3 PAGES)      : end of meta; payload starts at pool_off
+	if (!d)
+		return -EINVAL;
+	nqs = d->qctx_cap;
+	if (!nqs)
+		return -EINVAL;
+
+	/* Layout:
+	 * [ rx_ring_hdr + q[nqs] ]
+	 * [ descriptor_ring for q0 ][ descriptor_ring for q1 ] ... [ q(n-1) ]
+	 * [ recycle_ring    for q0 ][ recycle_ring    for q1 ] ... [ q(n-1) ]
+	 * [ pool region base for q0 ][ pool for q1 ] ... [ q(n-1) ] (offsets filled later)
 	 */
+	hdr_sz = sizeof(struct rx_ring_hdr) + sizeof(struct rx_hdr_qoff) * nqs;
+	dr_bytes = sizeof(struct descriptor_ring) + sizeof(struct trb_desc) * DESC_CAP;
+	rr_bytes = sizeof(struct recycle_ring) + sizeof(__u32) * FILL_CAP;
+	dr_region_off = ALIGN(hdr_sz, 64);
+	rr_region_off = ALIGN(dr_region_off + dr_bytes * nqs, 64);
+	pool_region_off = ALIGN(rr_region_off + rr_bytes * nqs, PAGE_SIZE);
 
-	hdr_sz = sizeof(struct rx_ring_hdr);
-	desc_bytes = sizeof(struct trb_desc) * DESC_CAP;
-	recycle_bytes = sizeof(struct recycle_ring) + sizeof(__u32) * FILL_CAP;
-
-	need_bytes = ALIGN(hdr_sz + desc_bytes + recycle_bytes, PAGE_SIZE);
+	/* For now reserve metadata only; per-queue pool offsets point to common pool base
+	 * and can be updated per queue later when pool layout is split.
+	 */
+	need_bytes = pool_region_off;
 	meta_bytes = META_PAGES * PAGE_SIZE;
 	if (meta_bytes < need_bytes)
 		meta_bytes = need_bytes;
+
+	/* Rebuild-safe */
+	if (d->meta_base) {
+		vfree(d->meta_base);
+		d->meta_base = NULL;
+		d->meta_bytes = 0;
+	}
+	kfree(d->dr_by_qid);
+	kfree(d->rr_by_qid);
+	d->dr_by_qid = NULL;
+	d->rr_by_qid = NULL;
 
 	base = vzalloc(meta_bytes);
 	if (!base)
 		return -ENOMEM;
 
+	d->dr_by_qid = kcalloc(nqs, sizeof(*d->dr_by_qid), GFP_KERNEL);
+	d->rr_by_qid = kcalloc(nqs, sizeof(*d->rr_by_qid), GFP_KERNEL);
+	if (!d->dr_by_qid || !d->rr_by_qid) {
+		kfree(d->dr_by_qid);
+		kfree(d->rr_by_qid);
+		d->dr_by_qid = NULL;
+		d->rr_by_qid = NULL;
+		vfree(base);
+		return -ENOMEM;
+	}
+
 	d->meta_base = base;
 	d->meta_bytes = meta_bytes;
 
 	hdr = d->hdr = (struct rx_ring_hdr *)base;
-	rxds = d->rx_desc = (struct trb_desc *)((__u8 *)base + hdr_sz);
-	rr = d->rr = (struct recycle_ring *)((__u8 *)base + hdr_sz + desc_bytes);
-
-	WRITE_ONCE(hdr->prod, 0);
-	WRITE_ONCE(hdr->con, 0);
+	hdr->num_qs = nqs;
+	hdr->reserved = 0;
 	WRITE_ONCE(hdr->doorbell, 0);
-	hdr->desc_cap = DESC_CAP;
-	hdr->fill_cap = FILL_CAP;
-	hdr->desc_off = hdr_sz;
 
-	rr->prod = rr->con = 0;
-	rr->cap = FILL_CAP;
-	rr->mask = FILL_CAP - 1;
-	hdr->rr_off = hdr->desc_off + desc_bytes;
-	hdr->pool_off = ALIGN(meta_bytes, PAGE_SIZE);
+	for (qid = 0; qid < nqs; qid++) {
+		hdr->q[qid].desc_off = dr_region_off + (u64)qid * dr_bytes;
+		hdr->q[qid].rr_off = rr_region_off + (u64)qid * rr_bytes;
+		hdr->q[qid].pool_off = pool_region_off; /* per-queue pool offsets can be specialized later */
+
+		dr = (struct descriptor_ring *)((__u8 *)base + hdr->q[qid].desc_off);
+		d->dr_by_qid[qid] = dr;
+		WRITE_ONCE(dr->prod, 0);
+		WRITE_ONCE(dr->con, 0);
+		dr->desc_cap = DESC_CAP;
+		dr->pool_size = 0;
+		dr->buf_cap = 0;
+		dr->buf_size = 0;
+
+		rr = (struct recycle_ring *)((__u8 *)base + hdr->q[qid].rr_off);
+		d->rr_by_qid[qid] = rr;
+		WRITE_ONCE(rr->prod, 0);
+		WRITE_ONCE(rr->con, 0);
+		rr->cap = FILL_CAP;
+		rr->mask = FILL_CAP - 1;
+	}
 
 	return 0;
 }
@@ -517,9 +768,10 @@ static int build_meta_and_userspace_pool(struct trb_dev *d)
 static int trb_publish_and_signal(struct queue_ctx *q, u32 new_prod)
 {
     struct rx_ring_hdr *hdr = q->dev->hdr;
-    bool was_empty = READ_ONCE(hdr->prod) == READ_ONCE(hdr->con);
+    struct descriptor_ring *dr = q->dr;
+    bool was_empty = READ_ONCE(dr->prod) == READ_ONCE(dr->con);
 
-    smp_store_release(&hdr->prod, new_prod);
+    smp_store_release(&dr->prod, new_prod);
 
     if (was_empty && likely(q->efd)) {
         WRITE_ONCE(hdr->doorbell, READ_ONCE(hdr->doorbell) + 1);
@@ -528,103 +780,107 @@ static int trb_publish_and_signal(struct queue_ctx *q, u32 new_prod)
     return 0;
 }
 
-static void test_buffers(struct queue_ctx *q, __u32 n)
-{
-    struct trb_dev *dev = q->dev;
-    struct rx_ring_hdr *hdr = q->dev->hdr;
-    __u32 prod = READ_ONCE(hdr->prod);
-    int made = 0;
-    __u32 buf_id;
-    struct page *pg;
-    struct trb_desc *td;
-    void *kva;
-    int len;
-    int j;
-
-    while (made < n ) {
-        if (!rr_pop(dev->rr, &buf_id))
-            break;
-        if (buf_id >= hdr->buf_cap)
-            break;
-        pg = dev->bufs[buf_id].page;
-        kva = kmap_local_page(pg);
-        len = min_t(int, 128 + prod * 8, hdr->buf_size);
-        for (j = 0; j < len; j++)
-            ((__u8*)kva)[j] = 0xA0 + ((prod + j) & 0x1F);
-        kunmap_local(kva);
-
-        td = &dev->rx_desc[prod & (hdr->desc_cap - 1)];
-        WRITE_ONCE(td->buf_id, buf_id);
-        WRITE_ONCE(td->len, len);
-        WRITE_ONCE(td->off, 0);
-        WRITE_ONCE(td->flags, 0);
-        prod++;
-        made++;
-
-    }
-
-    /* TO DO */
-
-
-}
-
 static long trb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-    struct queue_ctx *q = file->private_data;
-    struct rx_ring_hdr *hdr = q->dev->hdr;
-    struct eventfd_ctx *efd;
+	struct trb_dev *dev = file->private_data;
+	struct queue_ctx *q = NULL;
+	struct eventfd_ctx *efd;
 
-    switch (cmd) {
-    case IOCTL_REGISTER_EFD: {
-        int efd_fd;
-        if (copy_from_user(&efd_fd, (void __user*) arg, sizeof(efd_fd)))
-            return -EFAULT;
-        if (q->efd) {
-            eventfd_ctx_put(q->efd);
-            q->efd = NULL;
-        }
-        efd = eventfd_ctx_fdget(efd_fd);
-        if (IS_ERR(efd)) return PTR_ERR(efd);
-        q->efd = efd;
-        return 0;
-                 }
-    case IOCTL_TEST_PRODUCE: {
-        u32 add;
-        u32 cur;
-        if (copy_from_user(&add, (void __user*) arg, sizeof(add)))
-            return -EFAULT;
-        cur = READ_ONCE(hdr->prod);
-        test_buffers(q, add);
-        return trb_publish_and_signal(q, cur + add);
-                 }
-    default:
-        return -ENOIOCTLCMD;
-    }
+	if (!dev)
+		return -ENODEV;
+
+	switch (cmd) {
+	case IOCTL_SET_NUM_QS: {
+		__u16 nqs;
+
+		if (copy_from_user(&nqs, (void __user *)arg, sizeof(nqs)))
+			return -EFAULT;
+		return trb_set_num_qs(dev, nqs);
+	}
+	case IOCTL_REGISTER_EFD: {
+		struct trb_efd_req req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+
+		mutex_lock(&dev->qctx_lock);
+		if (!dev->qctx_by_rq || req.qid >= dev->qctx_cap) {
+			mutex_unlock(&dev->qctx_lock);
+			return -EINVAL;
+		}
+		q = dev->qctx_by_rq[req.qid];
+		if (!q) {
+			mutex_unlock(&dev->qctx_lock);
+			return -ENODEV;
+		}
+		mutex_unlock(&dev->qctx_lock);
+
+		efd = eventfd_ctx_fdget(req.efd_fd);
+		if (IS_ERR(efd))
+			return PTR_ERR(efd);
+
+		if (q->efd)
+			eventfd_ctx_put(q->efd);
+		q->efd = efd;
+		return 0;
+	}
+	case IOCTL_TEST_PRODUCE: {
+		return -EOPNOTSUPP;
+	}
+	case IOCTL_TRB_CONFIG: {
+		struct trb_cfg_req req;
+		struct net_device *netdev;
+		int ret;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+		req.ifname[IFNAMSIZ - 1] = '\0';
+
+		if (!req.ifname[0] || !req.num_qs)
+			return -EINVAL;
+
+		netdev = dev_get_by_name(&init_net, req.ifname);
+		if (!netdev)
+			return -ENODEV;
+
+		ret = mlx5e_trb_configure(netdev, !!req.enable, req.num_qs,
+					  req.fs_type, req.dport, dev);
+		dev_put(netdev);
+
+		return ret;
+	}
+	default:
+		return -ENOIOCTLCMD;
+	}
 }
 
 
 
 static int trb_open(struct inode *ino, struct file *file)
 {
-    q = kzalloc(sizeof(*q), GFP_KERNEL);
-   // struct queue_ctx *q = kzalloc(sizeof(*q), GFP_KERNEL);;
-    if (!q) 
-        return -ENOMEM;
-    q->dev = rx_dev;
-    q->efd = NULL;
-    file->private_data = q;
-    return 0;
+	struct trb_dev *dev;
+
+	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+	if (!dev)
+		return -ENOMEM;
+
+	mutex_init(&dev->qctx_lock);
+	atomic_set(&dev->mmap_cnt, 0);
+	INIT_LIST_HEAD(&dev->pending_qctx);
+	file->private_data = dev;
+	return 0;
 }
 
 static int trb_release(struct inode *ino, struct file *file)
 {
-    struct queue_ctx *q = file->private_data;
-    if (q) {
-        if (q->efd)
-            eventfd_ctx_put(q->efd);
-        kfree(q);
-    }
-    return 0;
+	struct trb_dev *dev = file->private_data;
+
+	if (dev && READ_ONCE(dev->total_qs))
+		return -EBUSY;
+
+	trb_dev_destroy(dev);
+	file->private_data = NULL;
+	return 0;
 }
 
 static const struct file_operations trb_fops = {
@@ -634,48 +890,42 @@ static const struct file_operations trb_fops = {
     .release = trb_release,
     .unlocked_ioctl = trb_ioctl,
 };
+
+static struct miscdevice trb_misc = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = DEV_NAME,
+	.fops = &trb_fops,
+	.mode = 0666,
+};
+
 static int __init trb_init(void)
 {
     int ret;
 
-    rx_dev = NULL;
     trb_dev_ready = false;
 
-    /*
-     * Only register the miscdevice at init; actual ring/pool
-     * allocation is deferred to the first trb_register_pp() call
-     * when a TRB-enabled RQ is created.
-     */
-    rx_dev = kzalloc(sizeof(struct trb_dev), GFP_KERNEL);
-    if (!rx_dev)
-        return -ENOMEM;
-    mutex_init(&rx_dev->qctx_lock);
-
-    rx_dev->misc.minor = MISC_DYNAMIC_MINOR;
-    rx_dev->misc.name = "trb_dev";
-    rx_dev->misc.fops = &trb_fops;
-    rx_dev->misc.mode = 0666;
-
-    ret = misc_register(&rx_dev->misc);
+    ret = misc_register(&trb_misc);
     if (ret) {
-        kfree(rx_dev);
-        rx_dev = NULL;
         return ret;
     }
     pr_info("%s: registered (deferred init)", DEV_NAME);
 	return 0;
 }
 
-static struct page *trb_free_ring_alloc(struct trb_dev *dev, __u32 *idx)
+static struct page *trb_free_ring_alloc(struct queue_ctx *qctx, __u32 *idx)
 {
+	struct trb_dev *dev;
 	struct trb_free_ring *ring;
 	struct trb_free_entry *entry;
 	u32 con;
 
-	if (!dev || !dev->free_ring)
+	if (!qctx || !idx)
+		return NULL;
+	dev = qctx->dev;
+	if (!dev || !qctx->free_ring)
 		return NULL;
 
-	ring = dev->free_ring;
+	ring = qctx->free_ring;
 	con = READ_ONCE(ring->con);
 	if (con == READ_ONCE(ring->prod))
 		return NULL;
@@ -688,42 +938,15 @@ static struct page *trb_free_ring_alloc(struct trb_dev *dev, __u32 *idx)
 	return entry->page;
 }
 
-int trb_free_ring_return(struct page *page, __u32 idx)
+struct page* trb_page_pool_alloc(struct queue_ctx *qctx, __u32 *idx)
 {
-	struct trb_dev *dev = rx_dev;
-	struct trb_free_ring *ring;
-	struct trb_free_entry *entry;
-	u32 prod;
-
-	if (!dev || !dev->free_ring || !page)
-		return -EINVAL;
-
-	ring = dev->free_ring;
-	prod = READ_ONCE(ring->prod);
-	if (prod - READ_ONCE(ring->con) >= ring->cap)
-		return -ENOSPC;
-
-	entry = &ring->entries[prod & (ring->cap - 1)];
-	entry->page = page;
-	entry->page_ix = idx;
-	pr_warn("TRB return idx=%u\n", idx);
-	smp_store_release(&ring->prod, prod + 1);
-	return 0;
-}
-EXPORT_SYMBOL_GPL(trb_free_ring_return);
-
-/* signature should take argument page_pool and queue_ctx. queue_ctx should help obtain the rr pointer when there is more than one core */
-struct page* trb_page_pool_alloc(__u32 *idx)
-{
-	struct trb_dev *dev = rx_dev;
-
-	if (!dev)
+	if (!qctx || !idx)
 		return NULL;
 
-	if (dev->rr)
-		drain_rr(dev->rr);
+	if (qctx->rr)
+		drain_rr(qctx);
 
-	return trb_free_ring_alloc(dev, idx);
+	return trb_free_ring_alloc(qctx, idx);
 }
 EXPORT_SYMBOL_GPL(trb_page_pool_alloc);
 
@@ -732,32 +955,35 @@ static inline bool trb_is_pp_page(struct page *page)
 	return (page->pp_magic & ~0x3UL) == PP_SIGNATURE;
 }
 
-static int trb_buf_from_region(struct trb_dev *dev, u32 page_ix, struct page *page,
+static int trb_buf_from_region(struct queue_ctx *qctx, u32 page_ix, struct page *page,
 			       u32 payload_start, u32 len,
 			       u32 *buf_id, u32 *off, u32 *seg_len)
 {
+	struct descriptor_ring *dr;
+	struct trb_free_ring *fr;
 	u32 bufs_per_page;
 	u32 page_bytes;
 	u32 buf_idx_in_page;
 
-	if (!page || !len)
+	if (!qctx || !page || !len)
 		return -EINVAL;
-
-	if (!dev->free_ring)
+	dr = qctx->dr;
+	fr = qctx->free_ring;
+	if (!dr || !fr || !dr->buf_size)
 		return -EINVAL;
 
 	page_bytes = PAGE_SIZE << compound_order(page);
-	bufs_per_page = DIV_ROUND_UP(page_bytes, dev->hdr->buf_size);
+	bufs_per_page = DIV_ROUND_UP(page_bytes, dr->buf_size);
 
-	if (page_ix >= dev->free_ring->cap)
+	if (page_ix >= fr->cap)
 		return -EINVAL;
 	if (payload_start >= page_bytes)
 		return -EINVAL;
 
-	buf_idx_in_page = payload_start / dev->hdr->buf_size;
+	buf_idx_in_page = payload_start / dr->buf_size;
 	*buf_id = page_ix * bufs_per_page + buf_idx_in_page;
-	*off = payload_start % dev->hdr->buf_size;
-	*seg_len = min_t(u32, len, dev->hdr->buf_size - *off);
+	*off = payload_start % dr->buf_size;
+	*seg_len = min_t(u32, len, dr->buf_size - *off);
 	return 0;
 }
 
@@ -796,16 +1022,20 @@ static int trb_count_segments_pp(struct sk_buff *skb)
 	return trb_count_segments_pp_one(skb);
 }
 
-static int trb_emit_segments_pp_one(struct trb_dev *dev, struct sk_buff *skb,
+static int trb_emit_segments_pp_one(struct queue_ctx *qctx, struct sk_buff *skb,
 				    u32 prod, int *seg_idx)
 {
-	struct rx_ring_hdr *hdr = dev->hdr;
+	struct descriptor_ring *dr;
 	struct skb_shared_info *sh;
 	struct page *head_page;
 	u32 head_len;
 	struct trb_desc *td;
 	struct sk_buff *frag_skb;
 	int i;
+
+	if (!qctx || !qctx->dr || !qctx->bufs)
+		return -EINVAL;
+	dr = qctx->dr;
 
 	sh = skb_shinfo(skb);
 	head_page = virt_to_head_page(skb->data);
@@ -817,13 +1047,13 @@ static int trb_emit_segments_pp_one(struct trb_dev *dev, struct sk_buff *skb,
 		payload_start = (u32)((unsigned long)skb->data -
 				      (unsigned long)page_address(head_page));
 		page_ix = READ_ONCE(skb->trb_head_page_ix);
-		if (trb_buf_from_region(dev, page_ix, head_page, payload_start,
+		if (trb_buf_from_region(qctx, page_ix, head_page, payload_start,
 					head_len, &buf_id, &off, &seg_len))
 			return -EINVAL;
 		pr_warn("TRB emit head: page_ix=%u buf_id=%u off=%u len=%u payload_start=%u buf_size=%u\n",
-			page_ix, buf_id, off, seg_len, payload_start, dev->hdr->buf_size);
+			page_ix, buf_id, off, seg_len, payload_start, dr->buf_size);
 
-		td = &dev->rx_desc[(prod + *seg_idx) & (hdr->desc_cap - 1)];
+		td = &dr->descs[(prod + *seg_idx) & (dr->desc_cap - 1)];
 			WRITE_ONCE(td->buf_id, buf_id);
 			WRITE_ONCE(td->len, seg_len);
 			WRITE_ONCE(td->off, off);
@@ -832,8 +1062,8 @@ static int trb_emit_segments_pp_one(struct trb_dev *dev, struct sk_buff *skb,
 				buf_id, skb, refcount_read(&skb->users),
 				skb->active_extensions, skb->extensions,
 				skb->trb_pkt, skb->trb_head_page_ix);
-			page_pool_ref_page(dev->bufs[buf_id].page);
-			dev->bufs[buf_id].inflight++;
+			page_pool_ref_page(qctx->bufs[buf_id].page);
+			qctx->bufs[buf_id].inflight++;
 			(*seg_idx)++;
 		}
 
@@ -847,14 +1077,14 @@ static int trb_emit_segments_pp_one(struct trb_dev *dev, struct sk_buff *skb,
 
 		payload_start = skb_frag_off(&sh->frags[i]);
 		page_ix = READ_ONCE(sh->trb_page_ix[i]);
-		if (trb_buf_from_region(dev, page_ix, fp, payload_start,
+		if (trb_buf_from_region(qctx, page_ix, fp, payload_start,
 					skb_frag_size(&sh->frags[i]),
 					&buf_id, &off, &seg_len))
 			return -EINVAL;
 		pr_warn("TRB emit frag: page_ix=%u buf_id=%u off=%u len=%u payload_start=%u buf_size=%u\n",
-			page_ix, buf_id, off, seg_len, payload_start, dev->hdr->buf_size);
+			page_ix, buf_id, off, seg_len, payload_start, dr->buf_size);
 
-		td = &dev->rx_desc[(prod + *seg_idx) & (hdr->desc_cap - 1)];
+		td = &dr->descs[(prod + *seg_idx) & (dr->desc_cap - 1)];
 			WRITE_ONCE(td->buf_id, buf_id);
 			WRITE_ONCE(td->len, seg_len);
 			WRITE_ONCE(td->off, off);
@@ -863,14 +1093,14 @@ static int trb_emit_segments_pp_one(struct trb_dev *dev, struct sk_buff *skb,
 				buf_id, skb, refcount_read(&skb->users),
 				skb->active_extensions, skb->extensions,
 				skb->trb_pkt, skb->trb_head_page_ix);
-			page_pool_ref_page(dev->bufs[buf_id].page);
-			dev->bufs[buf_id].inflight++;
+			page_pool_ref_page(qctx->bufs[buf_id].page);
+			qctx->bufs[buf_id].inflight++;
 			(*seg_idx)++;
 		}
 
 	skb_walk_frags(skb, frag_skb) {
         pr_warn("Walking SKB frags\n");
-		int err = trb_emit_segments_pp_one(dev, frag_skb, prod, seg_idx);
+		int err = trb_emit_segments_pp_one(qctx, frag_skb, prod, seg_idx);
 		if (err)
 			return err;
 	}
@@ -892,37 +1122,35 @@ static void trb_tcp_eat_recv_skb(struct sock *sk, struct sk_buff *skb)
 	__kfree_skb(skb);
 }
 
-/* Called after tcp_data_queue(); emit one descriptor per page-pool payload buffer. It should also have a struct queue_ctx *q param but for  not there is only 1 ctx and i have made it global */
-int trb_tcp_queue_skb( struct sock *sk, struct sk_buff *skb)
+/* Called after tcp_data_queue(); emit one descriptor per page-pool payload buffer. */
+int trb_tcp_queue_skb(struct queue_ctx *qctx, struct sock *sk,
+		      struct sk_buff *skb)
 {
-	struct trb_dev *dev;
-	struct rx_ring_hdr *hdr;
+	struct descriptor_ring *dr;
 	struct tcp_sock *tp;
-	struct queue_ctx *ctx = q;
 	u32 prod;
 	u32 con;
 	int seg_count;
 	int seg_idx;
 	u32 total_bytes;
 
-	dev = ctx ? ctx->dev : NULL;
-	if (!dev || !dev->hdr || !dev->pp || !skb)
+	if (!qctx || !qctx->dr || !qctx->pp || !qctx->bufs || !skb)
 		return -ENODEV;
 
-	hdr = dev->hdr;
+	dr = qctx->dr;
 	tp = tcp_sk(sk);
 
-	con = smp_load_acquire(&hdr->con);
-	prod = READ_ONCE(hdr->prod);
+	con = smp_load_acquire(&dr->con);
+	prod = READ_ONCE(dr->prod);
 	seg_count = trb_count_segments_pp(skb);
 
 	if (!seg_count)
 		return -EOPNOTSUPP;
-	if (prod - con + seg_count > hdr->desc_cap)
+	if (prod - con + seg_count > dr->desc_cap)
 		return -ENOSPC;
 
 	seg_idx = 0;
-	if (trb_emit_segments_pp_one(dev, skb, prod, &seg_idx))
+	if (trb_emit_segments_pp_one(qctx, skb, prod, &seg_idx))
 		return -EINVAL;
 
 	trb_tcp_eat_recv_skb(sk, skb);
@@ -931,36 +1159,12 @@ int trb_tcp_queue_skb( struct sock *sk, struct sk_buff *skb)
 	tcp_cleanup_rbuf(sk, total_bytes);
 	tcp_rcv_space_adjust(sk);
 
-	return trb_publish_and_signal(ctx, prod + seg_idx);
+	return trb_publish_and_signal(qctx, prod + seg_idx);
 }
 EXPORT_SYMBOL_GPL(trb_tcp_queue_skb);
 static void __exit trb_exit(void)
 {
-    int i;
-    if (rx_dev) {
-        misc_deregister(&rx_dev->misc);
-        if (trb_dev_ready) {
-            if (rx_dev->qctx_by_rq) {
-                for (i = 0; i < rx_dev->qctx_cap; i++)
-                    kfree(rx_dev->qctx_by_rq[i]);
-                kfree(rx_dev->qctx_by_rq);
-                rx_dev->qctx_by_rq = NULL;
-            }
-            if (rx_dev->bufs) {
-                for (i = 0; i < rx_dev->hdr->buf_cap; i++) {
-                    if (rx_dev->bufs[i].page)
-                        page_pool_put_page(rx_dev->pp, rx_dev->bufs[i].page, 0, true);
-                }
-            }
-            kfree(rx_dev->bufs);
-            kfree(rx_dev->pages);
-            kvfree(rx_dev->free_ring);
-            if (rx_dev->pp)
-                page_pool_destroy(rx_dev->pp);
-            vfree(rx_dev->meta_base);
-        }
-        kfree(rx_dev);
-        }
+	misc_deregister(&trb_misc);
 }
 
 module_init(trb_init);

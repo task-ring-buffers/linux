@@ -327,7 +327,7 @@ static int mlx5e_page_alloc_fragmented(struct mlx5e_rq *rq,
 	u32 trb_page_ix = 0;
 	if (rq->priv->channels.params.trb_enabled && rq->ix != 0) {
         pr_warn("TRB page is allocated: rq_ix: %d \n", rq->ix);
-		page = trb_page_pool_alloc(&trb_page_ix);
+		page = trb_page_pool_alloc(rq->trb_qctx, &trb_page_ix);
 		pr_warn("TRB assigned page_ix=%u rq_ix=%d page=%px\n",
 			trb_page_ix, rq->ix, page);
     }
@@ -364,7 +364,8 @@ static void mlx5e_page_release_fragmented(struct mlx5e_rq *rq,
 	if (page_pool_unref_page(page, drain_count) == 0) {
 #ifdef CONFIG_TRB_RX_RING_DEV
 		if (rq->priv->channels.params.trb_enabled && rq->ix != 0) {
-			if (trb_free_ring_return(page, frag_page->trb_page_ix))
+			if (trb_free_ring_return_ctx(rq->trb_qctx, page,
+						     frag_page->trb_page_ix))
 				page_pool_put_unrefed_page(rq->page_pool, page, -1, true);
 		} else {
 			page_pool_put_unrefed_page(rq->page_pool, page, -1, true);
@@ -1704,6 +1705,7 @@ static inline void mlx5e_complete_rx_cqe(struct mlx5e_rq *rq,
 	mlx5e_build_rx_skb(cqe, cqe_bcnt, rq, skb);
 #ifdef CONFIG_TRB_RX_RING_DEV
 	skb->trb_pkt = rq->priv->channels.params.trb_enabled && rq->ix != 0;
+	skb->trb_qctx = rq->trb_qctx;
 #endif
 }
 

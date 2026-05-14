@@ -405,70 +405,103 @@ void mlx5e_trb_rss_disable(struct mlx5e_rx_res *res)
 
 void destroy_trb_res(struct mlx5e_rx_res *res, unsigned int nch)
 {
-	int ix = nch;
+	int ix;
 
-        while (--ix >= 0)
+	/* TRB uses two steering endpoints:
+	 * [0] default traffic (q0)
+	 * [1] app traffic RSS over q1..q(n-1)
+	 */
+	if (!res->trb_channel_res)
+		return;
+
+	for (ix = 1; ix >= 0; ix--)
 		mlx5e_tir_destroy(&res->trb_channel_res[ix].trb_tir);
-
-        ix = nch;
-	while (--ix >= 0)
+	for (ix = 1; ix >= 0; ix--)
 		mlx5e_rqt_destroy(&res->trb_channel_res[ix].trb_rqt);
 
-        kvfree(res->trb_channel_res);
+	kvfree(res->trb_channel_res);
+	res->trb_channel_res = NULL;
 }
 
 int mlx5e_trb_res_create(struct mlx5e_rx_res *res, unsigned  int nch)
 {
-        struct mlx5e_tir_builder *builder;
-        int err = 0;
-        int ix;
+	struct mlx5e_tir_builder *builder;
+	struct mlx5e_rss_params_indir indir;
+	u32 app_nch;
+	u32 rqt_sz;
+	int err = 0;
+	int ix;
 
-        builder = mlx5e_tir_builder_alloc(false);
-        if (!builder)
-                return -ENOMEM;
-        res->trb_channel_res = kvcalloc(nch, sizeof(*res->trb_channel_res), GFP_KERNEL);
+	/* Need q0 (default) plus at least one app queue. */
+	if (nch < 2)
+		return -EINVAL;
 
-        if (!res->trb_channel_res) {
-                err = -ENOMEM;
-                goto out;
-        }
+	builder = mlx5e_tir_builder_alloc(false);
+	if (!builder)
+		return -ENOMEM;
 
-        for (ix = 0; ix < nch; ix++) {
-                err = mlx5e_rqt_init_direct(&res->trb_channel_res[ix].trb_rqt, res->mdev, false, res->rss_rqns[ix], 1);
-		//pr_warn("RQ no %d is %u\n", ix, res->rss_rqns[ix]);
-                if (err) {
-                        pr_warn("Failed to create RQT\n");
-                        goto err_destroy_direct_rqts;
-                }
-        }
+	res->trb_channel_res = kvcalloc(2, sizeof(*res->trb_channel_res), GFP_KERNEL);
+	if (!res->trb_channel_res) {
+		err = -ENOMEM;
+		goto out_builder;
+	}
 
-        for (ix = 0; ix < nch; ix++) {
-                mlx5e_tir_builder_build_rqt(builder, res->mdev->mlx5e_res.hw_objs.td.tdn, mlx5e_rqt_get_rqtn(&res->trb_channel_res[ix].trb_rqt), false);
-                mlx5e_tir_builder_build_packet_merge(builder, &res->pkt_merge_param);
-                mlx5e_tir_builder_build_direct(builder);
+	/* Slot 0: default traffic -> q0 only. */
+	err = mlx5e_rqt_init_direct(&res->trb_channel_res[0].trb_rqt, res->mdev, false,
+				    res->rss_rqns[0], 1);
+	if (err) {
+		pr_warn("Failed to create TRB default RQT\n");
+		goto err_destroy_rqts;
+	}
 
-                err = mlx5e_tir_init(&res->trb_channel_res[ix].trb_tir, builder, res->mdev, true);
-                if (err) {
-                        pr_warn("Failed to create a direct TIR: err = %d, ix = %u\n", err, ix);
-                        goto err_destroy_direct_tirs;
-                }
+	/* Slot 1: app traffic -> RSS over q1..q(n-1). */
+	app_nch = nch - 1;
+	rqt_sz = mlx5e_rqt_size(res->mdev, app_nch);
+	err = mlx5e_rss_params_indir_init(&indir, res->mdev, rqt_sz, rqt_sz);
+	if (err)
+		goto err_destroy_rqts;
 
-                mlx5e_tir_builder_clear(builder);
-        }
+	mlx5e_rss_params_indir_init_uniform(&indir, app_nch);
+	err = mlx5e_rqt_init_indir(&res->trb_channel_res[1].trb_rqt, res->mdev,
+				   &res->rss_rqns[1], NULL, app_nch,
+				   ETH_RSS_HASH_TOP, &indir);
+	mlx5e_rss_params_indir_cleanup(&indir);
+	if (err) {
+		pr_warn("Failed to create TRB app RSS RQT\n");
+		goto err_destroy_rqts;
+	}
 
-        goto out;
+	/* Build TIRs for both TRB endpoints. */
+	for (ix = 0; ix < 2; ix++) {
+		mlx5e_tir_builder_build_rqt(builder,
+					    res->mdev->mlx5e_res.hw_objs.td.tdn,
+					    mlx5e_rqt_get_rqtn(&res->trb_channel_res[ix].trb_rqt),
+					    false);
+		mlx5e_tir_builder_build_packet_merge(builder, &res->pkt_merge_param);
+		mlx5e_tir_builder_build_direct(builder);
 
-err_destroy_direct_tirs:
+		err = mlx5e_tir_init(&res->trb_channel_res[ix].trb_tir, builder,
+				     res->mdev, true);
+		if (err) {
+			pr_warn("Failed to create TRB TIR: err=%d slot=%d\n", err, ix);
+			goto err_destroy_tirs;
+		}
+
+		mlx5e_tir_builder_clear(builder);
+	}
+
+	goto out_builder;
+
+err_destroy_tirs:
 	while (--ix >= 0)
 		mlx5e_tir_destroy(&res->trb_channel_res[ix].trb_tir);
-
-        ix = nch;
-err_destroy_direct_rqts:
-	while (--ix >= 0)
+err_destroy_rqts:
+	for (ix = 1; ix >= 0; ix--)
 		mlx5e_rqt_destroy(&res->trb_channel_res[ix].trb_rqt);
 	kvfree(res->trb_channel_res);
-out:
-        mlx5e_tir_builder_free(builder);
+	res->trb_channel_res = NULL;
+out_builder:
+	mlx5e_tir_builder_free(builder);
 	return err;
 }
 

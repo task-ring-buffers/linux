@@ -65,6 +65,7 @@
 extern const struct net_device_ops mlx5e_netdev_ops;
 struct page_pool;
 struct queue_ctx;
+struct trb_dev;
 
 #define MLX5E_METADATA_ETHER_TYPE (0x8CE4)
 #define MLX5E_METADATA_ETHER_LEN 8
@@ -296,6 +297,9 @@ struct mlx5e_params {
 		} channel;
 	} mqprio;
 	bool trb_enabled;
+	struct trb_dev *trb_dev;
+	u8 trb_fs_type;
+	u16 trb_dport;
 	bool rx_cqe_compress_def;
 	struct dim_cq_moder rx_cq_moderation;
 	struct dim_cq_moder tx_cq_moderation;
@@ -719,6 +723,7 @@ struct mlx5e_rq {
 	struct mlx5e_xdpsq    *xdpsq;
 	DECLARE_BITMAP(flags, 8);
 	struct page_pool      *page_pool;
+	struct trb_dev        *trb_dev;
 	struct queue_ctx      *trb_qctx;
 
 	/* AF_XDP zero-copy */
@@ -1092,6 +1097,9 @@ int mlx5e_safe_switch_params(struct mlx5e_priv *priv,
 			     struct mlx5e_params *new_params,
 			     mlx5e_fp_preactivate preactivate,
 			     void *context, bool reset);
+int mlx5e_trb_configure(struct net_device *netdev, bool enable,
+			unsigned int num_channels, u8 trb_fs_type,
+			u16 trb_dport, struct trb_dev *trb_dev);
 int mlx5e_update_tx_netdev_queues(struct mlx5e_priv *priv);
 int mlx5e_num_channels_changed_ctx(struct mlx5e_priv *priv, void *context);
 int mlx5e_update_tc_and_tx_queues_ctx(struct mlx5e_priv *priv, void *context);

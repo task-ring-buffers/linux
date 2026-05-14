@@ -943,10 +943,12 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 		 * elevated refcnt.
 		 */
 		rq->trb_qctx = NULL;
+		rq->trb_dev = params->trb_dev;
 		if (params->trb_enabled && rq->ix != 0)
 			rq->page_pool = trb_register_pp(&pp_params,
 							rq->buff.frame0_sz,
-							rq->ix, &rq->trb_qctx);
+							rq->ix, rq->trb_dev,
+							&rq->trb_qctx);
 		else
 			rq->page_pool = page_pool_create(&pp_params);
 		if (IS_ERR(rq->page_pool)) {
@@ -999,10 +1001,11 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 	return 0;
 
 err_destroy_page_pool:
-	page_pool_destroy(rq->page_pool);
 	if (rq->trb_qctx) {
 		trb_unregister_qctx(rq->trb_qctx);
 		rq->trb_qctx = NULL;
+	} else {
+		page_pool_destroy(rq->page_pool);
 	}
 err_free_by_rq_type:
 	switch (rq->wq_type) {
@@ -1030,10 +1033,11 @@ err_rq_xdp_prog:
 static void mlx5e_free_rq(struct mlx5e_rq *rq)
 {
 	kvfree(rq->dim);
-	page_pool_destroy(rq->page_pool);
 	if (rq->trb_qctx) {
 		trb_unregister_qctx(rq->trb_qctx);
 		rq->trb_qctx = NULL;
+	} else {
+		page_pool_destroy(rq->page_pool);
 	}
 
 	switch (rq->wq_type) {
@@ -3322,8 +3326,8 @@ trb_activate:
 			//priv->channels = old_chs
 			goto err_destroy_trb;
 		}
-		params.type = TRB_FS_IPV4_TCP;
-		params.dport = 8080;
+		params.type = (enum trb_fs_types)priv->channels.params.trb_fs_type;
+		params.dport = priv->channels.params.trb_dport;
 		err = mlx5e_create_trb_table(priv->fs, priv->rx_res, &params);
 		if (err) {
 			pr_warn("trb flow table set up failed\n");
@@ -3352,6 +3356,74 @@ out:
 
 	return err;
 }
+
+int mlx5e_trb_configure(struct net_device *netdev, bool enable,
+			unsigned int num_channels, u8 trb_fs_type,
+			u16 trb_dport, struct trb_dev *trb_dev)
+{
+	struct mlx5e_priv *priv = netdev_priv(netdev);
+	struct mlx5e_params *cur_params = &priv->channels.params;
+	struct mlx5e_params new_params;
+	bool arfs_enabled;
+	bool opened;
+	int err = 0;
+
+	if (!num_channels) {
+		netdev_info(priv->netdev, "%s: combined_count=0 not supported\n",
+			    __func__);
+		return -EINVAL;
+	}
+
+	if (cur_params->num_channels == num_channels &&
+	    !!cur_params->trb_enabled == enable)
+		return 0;
+
+	if (mlx5e_rx_res_get_current_hash(priv->rx_res).hfunc == ETH_RSS_HASH_XOR) {
+		unsigned int xor8_max_channels = mlx5e_rqt_max_num_channels_allowed_for_xor8();
+
+		if (num_channels > xor8_max_channels) {
+			netdev_err(priv->netdev,
+				   "%s: Requested channels (%u) exceed XOR8 max (%u)\n",
+				   __func__, num_channels, xor8_max_channels);
+			return -EINVAL;
+		}
+	}
+
+	if (mlx5e_selq_is_htb_enabled(&priv->selq)) {
+		netdev_err(priv->netdev,
+			   "%s: HTB offload is active, cannot change channels\n",
+			   __func__);
+		return -EINVAL;
+	}
+
+	if (cur_params->mqprio.mode == TC_MQPRIO_MODE_CHANNEL) {
+		netdev_err(priv->netdev,
+			   "%s: MQPRIO channel offload is active, cannot change channels\n",
+			   __func__);
+		return -EINVAL;
+	}
+
+	new_params = *cur_params;
+	new_params.num_channels = num_channels;
+	new_params.trb_enabled = enable ? 1 : 0;
+	new_params.trb_dev = trb_dev;
+	new_params.trb_fs_type = trb_fs_type;
+	new_params.trb_dport = trb_dport;
+	MLX5E_SET_PFLAG(&new_params, MLX5E_PFLAG_CUSTOM_RQ, enable);
+
+	opened = test_bit(MLX5E_STATE_OPENED, &priv->state);
+	arfs_enabled = opened && mlx5e_fs_want_arfs(priv->netdev);
+	if (arfs_enabled)
+		mlx5e_arfs_disable(priv->fs);
+
+	err = mlx5e_safe_switch_params(priv, &new_params,
+				       mlx5e_num_channels_changed_ctx, NULL, true);
+
+	if (arfs_enabled)
+		mlx5e_arfs_enable(priv->fs);
+	return err;
+}
+EXPORT_SYMBOL_GPL(mlx5e_trb_configure);
 
 int mlx5e_safe_switch_params(struct mlx5e_priv *priv,
 			     struct mlx5e_params *params,

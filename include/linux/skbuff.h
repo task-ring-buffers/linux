@@ -275,6 +275,7 @@
 
 struct ahash_request;
 struct net_device;
+struct queue_ctx;
 struct scatterlist;
 struct pipe_inode_info;
 struct iov_iter;
@@ -951,6 +952,7 @@ struct sk_buff {
 #ifdef CONFIG_TRB_RX_RING_DEV
 	__u8			trb_pkt;
 	__u32			trb_head_page_ix;
+	struct queue_ctx	*trb_qctx;
 #endif
 #ifdef CONFIG_SKB_EXTENSIONS
 	__u8			active_extensions;

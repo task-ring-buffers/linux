@@ -5310,7 +5310,7 @@ queue_and_out:
 
 #ifdef CONFIG_TRB_RX_RING_DEV
 		if (trb_pkt) {
-			if (!trb_tcp_queue_skb(sk, skb))
+			if (!trb_tcp_queue_skb(skb->trb_qctx, sk, skb))
 				return;
 		}
 #endif
