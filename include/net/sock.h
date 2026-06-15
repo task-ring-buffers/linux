@@ -527,6 +527,7 @@ struct sock {
 				sk_txtime_unused : 6;
 
 	void			*sk_user_data;
+	u64			sk_trb_conn_id;
 #ifdef CONFIG_SECURITY
 	void			*sk_security;
 #endif
@@ -1208,6 +1209,8 @@ struct proto_accept_arg {
 	int err;
 	int is_empty;
 	bool kern;
+	bool set_trb_conn_id;
+	u64 trb_conn_id;
 };
 
 /* Networking protocol blocks we attach to sockets.

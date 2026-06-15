@@ -734,6 +734,10 @@ int mlx5_irq_table_create(struct mlx5_core_dev *dev)
 	pcif_vec = min_t(int, pcif_vec, pci_msix_vec_count(dev->pdev));
 
 	req_vec = pci_msix_can_alloc_dyn(dev->pdev) ? 1 : total_vec;
+	mlx5_core_warn(dev,
+		       "IRQ table create: pci_msix_vec_count=%d num_eqs=%d pcif_vec=%d total_vec=%d req_vec=%d dyn=%d\n",
+		       pci_msix_vec_count(dev->pdev), num_eqs, pcif_vec,
+		       total_vec, req_vec, pci_msix_can_alloc_dyn(dev->pdev));
 	n = pci_alloc_irq_vectors(dev->pdev, 1, req_vec, PCI_IRQ_MSIX);
 	if (n < 0)
 		return n;

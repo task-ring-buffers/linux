@@ -326,14 +326,17 @@ static int mlx5e_page_alloc_fragmented(struct mlx5e_rq *rq,
 	struct page *page;
 	u32 trb_page_ix = 0;
 	if (rq->priv->channels.params.trb_enabled && rq->ix != 0) {
-        pr_warn("TRB page is allocated: rq_ix: %d \n", rq->ix);
+#if 0
+		pr_warn("TRB page is allocated: rq_ix: %d \n", rq->ix);
+#endif
 		page = trb_page_pool_alloc(rq->trb_qctx, &trb_page_ix);
+#if 0
 		pr_warn("TRB assigned page_ix=%u rq_ix=%d page=%px\n",
 			trb_page_ix, rq->ix, page);
-    }
-	else {
+#endif
+	} else {
 		page = page_pool_dev_alloc_pages(rq->page_pool);
-    }
+	}
 	if (unlikely(!page))
 		return -ENOMEM;
 
@@ -347,9 +350,12 @@ static int mlx5e_page_alloc_fragmented(struct mlx5e_rq *rq,
 #endif
 	};
 #ifdef CONFIG_TRB_RX_RING_DEV
-	if (rq->priv->channels.params.trb_enabled && rq->ix != 0)
+	if (rq->priv->channels.params.trb_enabled && rq->ix != 0) {
+#if 0
 		pr_warn("TRB frag_page->trb_page_ix=%u rq_ix=%d page=%px\n",
 			frag_page->trb_page_ix, rq->ix, frag_page->page);
+#endif
+	}
 #endif
 
 	return 0;

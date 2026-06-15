@@ -2688,9 +2688,15 @@ static int mlx5e_open_channel(struct mlx5e_priv *priv, int ix,
 
 	mdev = mlx5_sd_ch_ix_get_dev(priv->mdev, ix);
 	vec_ix = mlx5_sd_ch_ix_get_vec_ix(mdev, ix);
+	mlx5_core_warn(mdev, "open_channel: ix=%d vec_ix=%d num_channels=%u\n",
+		       ix, vec_ix, params->num_channels);
 	cpu = mlx5_comp_vector_get_cpu(mdev, vec_ix);
 
 	err = mlx5_comp_irqn_get(mdev, vec_ix, &irq);
+	if (err)
+		mlx5_core_warn(mdev,
+			       "open_channel: mlx5_comp_irqn_get failed ix=%d vec_ix=%d err=%d\n",
+			       ix, vec_ix, err);
 	if (err)
 		return err;
 
@@ -3374,9 +3380,11 @@ int mlx5e_trb_configure(struct net_device *netdev, bool enable,
 		return -EINVAL;
 	}
 
+	mutex_lock(&priv->state_lock);
+
 	if (cur_params->num_channels == num_channels &&
 	    !!cur_params->trb_enabled == enable)
-		return 0;
+		goto out_unlock;
 
 	if (mlx5e_rx_res_get_current_hash(priv->rx_res).hfunc == ETH_RSS_HASH_XOR) {
 		unsigned int xor8_max_channels = mlx5e_rqt_max_num_channels_allowed_for_xor8();
@@ -3385,7 +3393,8 @@ int mlx5e_trb_configure(struct net_device *netdev, bool enable,
 			netdev_err(priv->netdev,
 				   "%s: Requested channels (%u) exceed XOR8 max (%u)\n",
 				   __func__, num_channels, xor8_max_channels);
-			return -EINVAL;
+			err = -EINVAL;
+			goto out_unlock;
 		}
 	}
 
@@ -3393,14 +3402,16 @@ int mlx5e_trb_configure(struct net_device *netdev, bool enable,
 		netdev_err(priv->netdev,
 			   "%s: HTB offload is active, cannot change channels\n",
 			   __func__);
-		return -EINVAL;
+		err = -EINVAL;
+		goto out_unlock;
 	}
 
 	if (cur_params->mqprio.mode == TC_MQPRIO_MODE_CHANNEL) {
 		netdev_err(priv->netdev,
 			   "%s: MQPRIO channel offload is active, cannot change channels\n",
 			   __func__);
-		return -EINVAL;
+		err = -EINVAL;
+		goto out_unlock;
 	}
 
 	new_params = *cur_params;
@@ -3421,6 +3432,8 @@ int mlx5e_trb_configure(struct net_device *netdev, bool enable,
 
 	if (arfs_enabled)
 		mlx5e_arfs_enable(priv->fs);
+out_unlock:
+	mutex_unlock(&priv->state_lock);
 	return err;
 }
 EXPORT_SYMBOL_GPL(mlx5e_trb_configure);

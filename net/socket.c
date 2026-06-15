@@ -1953,6 +1953,9 @@ struct file *do_accept(struct file *file, struct proto_accept_arg *arg,
 	if (err < 0)
 		goto out_fd;
 
+	if (arg->set_trb_conn_id && newsock->sk)
+		WRITE_ONCE(newsock->sk->sk_trb_conn_id, arg->trb_conn_id);
+
 	if (upeer_sockaddr) {
 		len = ops->getname(newsock, (struct sockaddr *)&address, 2);
 		if (len < 0) {
@@ -1980,6 +1983,39 @@ static int __sys_accept4_file(struct file *file, struct sockaddr __user *upeer_s
 	int newfd;
 
 	if (flags & ~(SOCK_CLOEXEC | SOCK_NONBLOCK))
+		return -EINVAL;
+
+	if (SOCK_NONBLOCK != O_NONBLOCK && (flags & SOCK_NONBLOCK))
+		flags = (flags & ~SOCK_NONBLOCK) | O_NONBLOCK;
+
+	newfd = get_unused_fd_flags(flags);
+	if (unlikely(newfd < 0))
+		return newfd;
+
+	newfile = do_accept(file, &arg, upeer_sockaddr, upeer_addrlen,
+			    flags);
+	if (IS_ERR(newfile)) {
+		put_unused_fd(newfd);
+		return PTR_ERR(newfile);
+	}
+	fd_install(newfd, newfile);
+	return newfd;
+}
+
+static int __sys_accept5_file(struct file *file, struct sockaddr __user *upeer_sockaddr,
+			      int __user *upeer_addrlen, int flags,
+			      u64 trb_conn_id)
+{
+	struct proto_accept_arg arg = {
+		.set_trb_conn_id = true,
+		.trb_conn_id = trb_conn_id,
+	};
+	struct file *newfile;
+	int newfd;
+
+	if (flags & ~(SOCK_CLOEXEC | SOCK_NONBLOCK))
+		return -EINVAL;
+	if (!trb_conn_id)
 		return -EINVAL;
 
 	if (SOCK_NONBLOCK != O_NONBLOCK && (flags & SOCK_NONBLOCK))
@@ -2027,10 +2063,33 @@ int __sys_accept4(int fd, struct sockaddr __user *upeer_sockaddr,
 	return ret;
 }
 
+static int __sys_accept5(int fd, struct sockaddr __user *upeer_sockaddr,
+			 int __user *upeer_addrlen, int flags, u64 trb_conn_id)
+{
+	int ret = -EBADF;
+	struct fd f;
+
+	f = fdget(fd);
+	if (fd_file(f)) {
+		ret = __sys_accept5_file(fd_file(f), upeer_sockaddr,
+					 upeer_addrlen, flags, trb_conn_id);
+		fdput(f);
+	}
+
+	return ret;
+}
+
 SYSCALL_DEFINE4(accept4, int, fd, struct sockaddr __user *, upeer_sockaddr,
 		int __user *, upeer_addrlen, int, flags)
 {
 	return __sys_accept4(fd, upeer_sockaddr, upeer_addrlen, flags);
+}
+
+SYSCALL_DEFINE5(accept5, int, fd, struct sockaddr __user *, upeer_sockaddr,
+		int __user *, upeer_addrlen, int, flags, u64, trb_conn_id)
+{
+	return __sys_accept5(fd, upeer_sockaddr, upeer_addrlen, flags,
+			     trb_conn_id);
 }
 
 SYSCALL_DEFINE3(accept, int, fd, struct sockaddr __user *, upeer_sockaddr,

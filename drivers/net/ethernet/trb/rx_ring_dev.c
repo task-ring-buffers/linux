@@ -72,6 +72,7 @@ struct rx_ring_hdr {
 };
 
 struct trb_desc {
+	__u64 conn_id; /* app-provided connection id from accept5() */
 	__u32 buf_id; /* index into payload buffers (0 ... buf_cap - 1) */
 	__u32 len;    /* valid bytes starting at off */
 	__u32 off;    /* byte offset within the buffer */
@@ -351,6 +352,7 @@ static int trb_mmap(struct file *file, struct vm_area_struct *vma)
 	unsigned long len = vma->vm_end - vma->vm_start;
 	unsigned long need;
 	unsigned long off;
+	unsigned long cursor;
 	struct page *pg;
 	u16 qid;
 	int ret;
@@ -363,20 +365,22 @@ static int trb_mmap(struct file *file, struct vm_area_struct *vma)
 
 	need = d->meta_bytes;
 	mutex_lock(&d->qctx_lock);
+	cursor = d->hdr->q[0].pool_off;
 	if (d->qctx_by_rq) {
 		for (qid = 0; qid < d->qctx_cap; qid++) {
 			struct queue_ctx *qctx = d->qctx_by_rq[qid];
-			unsigned long qneed;
+			unsigned long qbytes;
 
 			if (!qctx || !qctx->free_ring)
 				continue;
 
-			qneed = d->hdr->q[qid].pool_off +
-				(unsigned long)qctx->free_ring->cap * PAGE_SIZE;
-			if (qneed > need)
-				need = qneed;
+			d->hdr->q[qid].pool_off = cursor;
+			qbytes = (unsigned long)qctx->free_ring->cap * PAGE_SIZE;
+			cursor += qbytes;
 		}
 	}
+	if (cursor > need)
+		need = cursor;
 	mutex_unlock(&d->qctx_lock);
 
 	if (len < need)
@@ -669,7 +673,7 @@ err_free_ctx_only:
 static int build_meta_and_userspace_pool(struct trb_dev *d)
 {
 	size_t hdr_sz, dr_bytes, rr_bytes, need_bytes, meta_bytes;
-	size_t dr_region_off, rr_region_off, pool_region_off;
+	size_t dr_region_off, rr_region_off, pool_base_off;
 	struct rx_ring_hdr *hdr;
 	struct descriptor_ring *dr;
 	struct recycle_ring *rr;
@@ -694,15 +698,15 @@ static int build_meta_and_userspace_pool(struct trb_dev *d)
 	rr_bytes = sizeof(struct recycle_ring) + sizeof(__u32) * FILL_CAP;
 	dr_region_off = ALIGN(hdr_sz, 64);
 	rr_region_off = ALIGN(dr_region_off + dr_bytes * nqs, 64);
-	pool_region_off = ALIGN(rr_region_off + rr_bytes * nqs, PAGE_SIZE);
+	need_bytes = ALIGN(rr_region_off + rr_bytes * nqs, PAGE_SIZE);
 
 	/* For now reserve metadata only; per-queue pool offsets point to common pool base
 	 * and can be updated per queue later when pool layout is split.
 	 */
-	need_bytes = pool_region_off;
 	meta_bytes = META_PAGES * PAGE_SIZE;
 	if (meta_bytes < need_bytes)
 		meta_bytes = need_bytes;
+	pool_base_off = ALIGN(meta_bytes, PAGE_SIZE);
 
 	/* Rebuild-safe */
 	if (d->meta_base) {
@@ -741,7 +745,7 @@ static int build_meta_and_userspace_pool(struct trb_dev *d)
 	for (qid = 0; qid < nqs; qid++) {
 		hdr->q[qid].desc_off = dr_region_off + (u64)qid * dr_bytes;
 		hdr->q[qid].rr_off = rr_region_off + (u64)qid * rr_bytes;
-		hdr->q[qid].pool_off = pool_region_off; /* per-queue pool offsets can be specialized later */
+		hdr->q[qid].pool_off = 0;
 
 		dr = (struct descriptor_ring *)((__u8 *)base + hdr->q[qid].desc_off);
 		d->dr_by_qid[qid] = dr;
@@ -759,6 +763,9 @@ static int build_meta_and_userspace_pool(struct trb_dev *d)
 		rr->cap = FILL_CAP;
 		rr->mask = FILL_CAP - 1;
 	}
+
+	/* Base cursor for mmap-time pool layout assignment. */
+	hdr->q[0].pool_off = pool_base_off;
 
 	return 0;
 }
@@ -830,6 +837,7 @@ static long trb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case IOCTL_TRB_CONFIG: {
 		struct trb_cfg_req req;
 		struct net_device *netdev;
+		unsigned int num_channels;
 		int ret;
 
 		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
@@ -843,8 +851,13 @@ static long trb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (!netdev)
 			return -ENODEV;
 
-		ret = mlx5e_trb_configure(netdev, !!req.enable, req.num_qs,
+		/* userspace passes worker queues (n); driver needs q0 + n */
+		num_channels = req.num_qs + 1;
+
+		rtnl_lock();
+		ret = mlx5e_trb_configure(netdev, !!req.enable, num_channels,
 					  req.fs_type, req.dport, dev);
+		rtnl_unlock();
 		dev_put(netdev);
 
 		return ret;
@@ -932,8 +945,9 @@ static struct page *trb_free_ring_alloc(struct queue_ctx *qctx, __u32 *idx)
 
 	entry = &ring->entries[con & (ring->cap - 1)];
 	*idx = entry->page_ix;
-	pr_warn("TRB alloc: idx=%u page=%px con=%u prod=%u\n",
-		*idx, entry->page, con, READ_ONCE(ring->prod));
+	/* pr_warn("TRB alloc: idx=%u page=%px con=%u prod=%u\n",
+	 *	*idx, entry->page, con, READ_ONCE(ring->prod));
+	 */
 	smp_store_release(&ring->con, con + 1);
 	return entry->page;
 }
@@ -1023,7 +1037,7 @@ static int trb_count_segments_pp(struct sk_buff *skb)
 }
 
 static int trb_emit_segments_pp_one(struct queue_ctx *qctx, struct sk_buff *skb,
-				    u32 prod, int *seg_idx)
+				    u32 prod, int *seg_idx, u64 conn_id)
 {
 	struct descriptor_ring *dr;
 	struct skb_shared_info *sh;
@@ -1053,11 +1067,12 @@ static int trb_emit_segments_pp_one(struct queue_ctx *qctx, struct sk_buff *skb,
 		pr_warn("TRB emit head: page_ix=%u buf_id=%u off=%u len=%u payload_start=%u buf_size=%u\n",
 			page_ix, buf_id, off, seg_len, payload_start, dr->buf_size);
 
-		td = &dr->descs[(prod + *seg_idx) & (dr->desc_cap - 1)];
-			WRITE_ONCE(td->buf_id, buf_id);
-			WRITE_ONCE(td->len, seg_len);
-			WRITE_ONCE(td->off, off);
-			WRITE_ONCE(td->flags, 0);
+			td = &dr->descs[(prod + *seg_idx) & (dr->desc_cap - 1)];
+				WRITE_ONCE(td->conn_id, conn_id);
+				WRITE_ONCE(td->buf_id, buf_id);
+				WRITE_ONCE(td->len, seg_len);
+				WRITE_ONCE(td->off, off);
+				WRITE_ONCE(td->flags, 0);
 			pr_warn("TRB emit store head: buf_id=%u skb=%px users=%d active_ext=%u ext=%px trb_pkt=%u trb_head_ix=%u\n",
 				buf_id, skb, refcount_read(&skb->users),
 				skb->active_extensions, skb->extensions,
@@ -1084,11 +1099,12 @@ static int trb_emit_segments_pp_one(struct queue_ctx *qctx, struct sk_buff *skb,
 		pr_warn("TRB emit frag: page_ix=%u buf_id=%u off=%u len=%u payload_start=%u buf_size=%u\n",
 			page_ix, buf_id, off, seg_len, payload_start, dr->buf_size);
 
-		td = &dr->descs[(prod + *seg_idx) & (dr->desc_cap - 1)];
-			WRITE_ONCE(td->buf_id, buf_id);
-			WRITE_ONCE(td->len, seg_len);
-			WRITE_ONCE(td->off, off);
-			WRITE_ONCE(td->flags, 0);
+			td = &dr->descs[(prod + *seg_idx) & (dr->desc_cap - 1)];
+				WRITE_ONCE(td->conn_id, conn_id);
+				WRITE_ONCE(td->buf_id, buf_id);
+				WRITE_ONCE(td->len, seg_len);
+				WRITE_ONCE(td->off, off);
+				WRITE_ONCE(td->flags, 0);
 			pr_warn("TRB emit store frag: buf_id=%u skb=%px users=%d active_ext=%u ext=%px trb_pkt=%u trb_head_ix=%u\n",
 				buf_id, skb, refcount_read(&skb->users),
 				skb->active_extensions, skb->extensions,
@@ -1098,12 +1114,13 @@ static int trb_emit_segments_pp_one(struct queue_ctx *qctx, struct sk_buff *skb,
 			(*seg_idx)++;
 		}
 
-	skb_walk_frags(skb, frag_skb) {
-        pr_warn("Walking SKB frags\n");
-		int err = trb_emit_segments_pp_one(qctx, frag_skb, prod, seg_idx);
-		if (err)
-			return err;
-	}
+		skb_walk_frags(skb, frag_skb) {
+	        pr_warn("Walking SKB frags\n");
+			int err = trb_emit_segments_pp_one(qctx, frag_skb, prod, seg_idx,
+							    conn_id);
+			if (err)
+				return err;
+		}
 
 	return 0;
 }
@@ -1130,6 +1147,7 @@ int trb_tcp_queue_skb(struct queue_ctx *qctx, struct sock *sk,
 	struct tcp_sock *tp;
 	u32 prod;
 	u32 con;
+	u64 conn_id;
 	int seg_count;
 	int seg_idx;
 	u32 total_bytes;
@@ -1139,6 +1157,7 @@ int trb_tcp_queue_skb(struct queue_ctx *qctx, struct sock *sk,
 
 	dr = qctx->dr;
 	tp = tcp_sk(sk);
+	conn_id = READ_ONCE(sk->sk_trb_conn_id);
 
 	con = smp_load_acquire(&dr->con);
 	prod = READ_ONCE(dr->prod);
@@ -1150,7 +1169,7 @@ int trb_tcp_queue_skb(struct queue_ctx *qctx, struct sock *sk,
 		return -ENOSPC;
 
 	seg_idx = 0;
-	if (trb_emit_segments_pp_one(qctx, skb, prod, &seg_idx))
+	if (trb_emit_segments_pp_one(qctx, skb, prod, &seg_idx, conn_id))
 		return -EINVAL;
 
 	trb_tcp_eat_recv_skb(sk, skb);
