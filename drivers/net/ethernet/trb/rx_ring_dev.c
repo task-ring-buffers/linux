@@ -32,6 +32,8 @@
 /* Switch to pp_frag for sub_page buffers */
 #define BUF_SIZE PAGE_SIZE
 
+#define TRB_DESC_F_CLOSE 0x1
+
 
 struct trb_efd_req {
 	__u16 qid;
@@ -1036,6 +1038,18 @@ static int trb_count_segments_pp(struct sk_buff *skb)
 	return trb_count_segments_pp_one(skb);
 }
 
+static void trb_emit_close_desc(struct queue_ctx *qctx, u32 prod, u64 conn_id)
+{
+	struct trb_desc *td;
+
+	td = &qctx->dr->descs[prod & (qctx->dr->desc_cap - 1)];
+	WRITE_ONCE(td->conn_id, conn_id);
+	WRITE_ONCE(td->buf_id, 0);
+	WRITE_ONCE(td->len, 0);
+	WRITE_ONCE(td->off, 0);
+	WRITE_ONCE(td->flags, TRB_DESC_F_CLOSE);
+}
+
 static int trb_emit_segments_pp_one(struct queue_ctx *qctx, struct sk_buff *skb,
 				    u32 prod, int *seg_idx, u64 conn_id)
 {
@@ -1150,7 +1164,9 @@ int trb_tcp_queue_skb(struct queue_ctx *qctx, struct sock *sk,
 	u64 conn_id;
 	int seg_count;
 	int seg_idx;
+	int desc_count;
 	u32 total_bytes;
+	bool close_desc;
 
 	if (!qctx || !qctx->dr || !qctx->pp || !qctx->bufs || !skb)
 		return -ENODEV;
@@ -1162,15 +1178,22 @@ int trb_tcp_queue_skb(struct queue_ctx *qctx, struct sock *sk,
 	con = smp_load_acquire(&dr->con);
 	prod = READ_ONCE(dr->prod);
 	seg_count = trb_count_segments_pp(skb);
+	close_desc = TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN;
+	desc_count = seg_count + (close_desc ? 1 : 0);
 
-	if (!seg_count)
+	if (!desc_count)
 		return -EOPNOTSUPP;
-	if (prod - con + seg_count > dr->desc_cap)
+	if (prod - con + desc_count > dr->desc_cap)
 		return -ENOSPC;
 
 	seg_idx = 0;
-	if (trb_emit_segments_pp_one(qctx, skb, prod, &seg_idx, conn_id))
+	if (seg_count &&
+	    trb_emit_segments_pp_one(qctx, skb, prod, &seg_idx, conn_id))
 		return -EINVAL;
+	if (close_desc) {
+		trb_emit_close_desc(qctx, prod + seg_idx, conn_id);
+		seg_idx++;
+	}
 
 	trb_tcp_eat_recv_skb(sk, skb);
 	total_bytes = TCP_SKB_CB(skb)->end_seq - TCP_SKB_CB(skb)->seq;
