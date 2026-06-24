@@ -528,6 +528,8 @@ struct sock {
 
 	void			*sk_user_data;
 	u64			sk_trb_conn_id;
+	void			*sk_trb_deferred;
+	unsigned long		sk_trb_flags;
 #ifdef CONFIG_SECURITY
 	void			*sk_security;
 #endif

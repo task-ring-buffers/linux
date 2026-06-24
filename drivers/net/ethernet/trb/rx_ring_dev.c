@@ -18,6 +18,8 @@
 #include <net/trb.h>
 #include <linux/poison.h>
 #include <linux/highmem.h>
+#include <linux/workqueue.h>
+#include <linux/processor.h>
 #include <linux/mutex.h>
 #include <linux/list.h>
 
@@ -33,6 +35,13 @@
 #define BUF_SIZE PAGE_SIZE
 
 #define TRB_DESC_F_CLOSE 0x1
+#define TRB_CONN_POLL_ITERS 64
+
+enum trb_sock_flags {
+	TRB_SOCKF_DEFERRED_PENDING = 0,
+	TRB_SOCKF_DRAINING,
+	TRB_SOCKF_WORK_SCHED,
+};
 
 
 struct trb_efd_req {
@@ -141,6 +150,13 @@ struct trb_dev {
 
     /* Payload backing via page_pool */
 
+};
+
+struct trb_deferred_entry {
+	struct work_struct work;
+	struct sock *sk;
+	struct queue_ctx *qctx;
+	int cpu;
 };
 
 struct queue_ctx {
@@ -1050,6 +1066,148 @@ static void trb_emit_close_desc(struct queue_ctx *qctx, u32 prod, u64 conn_id)
 	WRITE_ONCE(td->flags, TRB_DESC_F_CLOSE);
 }
 
+static void trb_deferred_entry_free(struct sock *sk)
+{
+	struct trb_deferred_entry *entry;
+
+	entry = READ_ONCE(sk->sk_trb_deferred);
+	if (!entry)
+		return;
+
+	WRITE_ONCE(sk->sk_trb_deferred, NULL);
+	sock_put(entry->sk);
+	kfree(entry);
+}
+
+static int __trb_tcp_queue_one(struct queue_ctx *qctx, struct sock *sk,
+			       struct sk_buff *skb);
+
+static int trb_try_poll_conn_id(const struct sock *sk, u64 *conn_id)
+{
+	int i;
+
+	for (i = 0; i < TRB_CONN_POLL_ITERS; i++) {
+		*conn_id = READ_ONCE(sk->sk_trb_conn_id);
+		if (*conn_id)
+			return 1;
+		cpu_relax();
+	}
+
+	return 0;
+}
+
+static void trb_schedule_deferred_work(struct sock *sk)
+{
+	struct trb_deferred_entry *entry;
+
+	entry = READ_ONCE(sk->sk_trb_deferred);
+	if (!entry)
+		return;
+
+	if (test_and_set_bit(TRB_SOCKF_WORK_SCHED, &sk->sk_trb_flags))
+		return;
+
+	schedule_work_on(entry->cpu, &entry->work);
+}
+
+static int trb_drain_sock_queue(struct queue_ctx *qctx, struct sock *sk)
+{
+	struct trb_deferred_entry *entry;
+	int ret = 0;
+
+	if (test_and_set_bit(TRB_SOCKF_DRAINING, &sk->sk_trb_flags))
+		return 0;
+
+	lock_sock(sk);
+
+	if (!READ_ONCE(sk->sk_trb_conn_id))
+		goto out_unlock;
+
+	for (;;) {
+		struct sk_buff *skb;
+
+		skb = skb_peek(&sk->sk_receive_queue);
+		if (!skb)
+			break;
+
+		ret = __trb_tcp_queue_one(qctx, sk, skb);
+		if (ret == -ENOSPC)
+			break;
+		if (ret < 0) {
+			pr_warn("TRB drain failed qid=%u conn_id=%llu ret=%d\n",
+				qctx->qid,
+				(unsigned long long)READ_ONCE(sk->sk_trb_conn_id),
+				ret);
+			break;
+		}
+	}
+
+	if (skb_queue_empty(&sk->sk_receive_queue))
+		clear_bit(TRB_SOCKF_DEFERRED_PENDING, &sk->sk_trb_flags);
+
+out_unlock:
+	release_sock(sk);
+	clear_bit(TRB_SOCKF_DRAINING, &sk->sk_trb_flags);
+	clear_bit(TRB_SOCKF_WORK_SCHED, &sk->sk_trb_flags);
+
+	if (!test_bit(TRB_SOCKF_DEFERRED_PENDING, &sk->sk_trb_flags) &&
+	    !test_bit(TRB_SOCKF_DRAINING, &sk->sk_trb_flags)) {
+		entry = READ_ONCE(sk->sk_trb_deferred);
+		if (entry && entry->qctx == qctx)
+			trb_deferred_entry_free(sk);
+	} else if (ret == -ENOSPC) {
+		trb_schedule_deferred_work(sk);
+	}
+
+	return ret;
+}
+
+static void trb_deferred_workfn(struct work_struct *work)
+{
+	struct trb_deferred_entry *entry =
+		container_of(work, struct trb_deferred_entry, work);
+
+	trb_drain_sock_queue(entry->qctx, entry->sk);
+}
+
+static int trb_mark_socket_deferred(struct queue_ctx *qctx, struct sock *sk)
+{
+	struct trb_deferred_entry *entry;
+
+	entry = READ_ONCE(sk->sk_trb_deferred);
+	if (!entry) {
+		entry = kzalloc(sizeof(*entry), GFP_ATOMIC);
+		if (!entry)
+			return -ENOMEM;
+
+		INIT_WORK(&entry->work, trb_deferred_workfn);
+		entry->sk = sk;
+		entry->qctx = qctx;
+		entry->cpu = raw_smp_processor_id();
+		sock_hold(sk);
+		WRITE_ONCE(sk->sk_trb_deferred, entry);
+	}
+
+	if (entry->qctx != qctx)
+		pr_warn("TRB deferred owner changed old_qid=%u new_qid=%u\n",
+			entry->qctx ? entry->qctx->qid : 0, qctx->qid);
+
+	set_bit(TRB_SOCKF_DEFERRED_PENDING, &sk->sk_trb_flags);
+	return 0;
+}
+
+void trb_accept_ready(struct sock *sk)
+{
+	if (!sk)
+		return;
+
+	if (!test_bit(TRB_SOCKF_DEFERRED_PENDING, &sk->sk_trb_flags))
+		return;
+
+	trb_schedule_deferred_work(sk);
+}
+EXPORT_SYMBOL_GPL(trb_accept_ready);
+
 static int trb_emit_segments_pp_one(struct queue_ctx *qctx, struct sk_buff *skb,
 				    u32 prod, int *seg_idx, u64 conn_id)
 {
@@ -1154,8 +1312,8 @@ static void trb_tcp_eat_recv_skb(struct sock *sk, struct sk_buff *skb)
 }
 
 /* Called after tcp_data_queue(); emit one descriptor per page-pool payload buffer. */
-int trb_tcp_queue_skb(struct queue_ctx *qctx, struct sock *sk,
-		      struct sk_buff *skb)
+static int __trb_tcp_queue_one(struct queue_ctx *qctx, struct sock *sk,
+			       struct sk_buff *skb)
 {
 	struct descriptor_ring *dr;
 	struct tcp_sock *tp;
@@ -1202,6 +1360,26 @@ int trb_tcp_queue_skb(struct queue_ctx *qctx, struct sock *sk,
 	tcp_rcv_space_adjust(sk);
 
 	return trb_publish_and_signal(qctx, prod + seg_idx);
+}
+
+int trb_tcp_queue_skb(struct queue_ctx *qctx, struct sock *sk,
+		      struct sk_buff *skb)
+{
+	u64 conn_id;
+	int ret;
+
+	if (!qctx || !sk || !skb)
+		return -ENODEV;
+
+	conn_id = READ_ONCE(sk->sk_trb_conn_id);
+	if (!conn_id && !trb_try_poll_conn_id(sk, &conn_id)) {
+		ret = trb_mark_socket_deferred(qctx, sk);
+		if (ret)
+			return ret;
+		return 0;
+	}
+
+	return trb_drain_sock_queue(qctx, sk);
 }
 EXPORT_SYMBOL_GPL(trb_tcp_queue_skb);
 static void __exit trb_exit(void)

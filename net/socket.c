@@ -81,6 +81,7 @@
 #include <linux/compat.h>
 #include <linux/kmod.h>
 #include <linux/audit.h>
+#include <net/trb.h>
 #include <linux/wireless.h>
 #include <linux/nsproxy.h>
 #include <linux/magic.h>
@@ -1953,8 +1954,10 @@ struct file *do_accept(struct file *file, struct proto_accept_arg *arg,
 	if (err < 0)
 		goto out_fd;
 
-	if (arg->set_trb_conn_id && newsock->sk)
+	if (arg->set_trb_conn_id && newsock->sk) {
 		WRITE_ONCE(newsock->sk->sk_trb_conn_id, arg->trb_conn_id);
+		trb_accept_ready(newsock->sk);
+	}
 
 	if (upeer_sockaddr) {
 		len = ops->getname(newsock, (struct sockaddr *)&address, 2);
