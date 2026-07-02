@@ -96,6 +96,7 @@ typedef struct {
 } socket_lock_t;
 
 struct sock;
+struct trb_ids_allocator;
 struct proto;
 struct net;
 
@@ -527,7 +528,9 @@ struct sock {
 				sk_txtime_unused : 6;
 
 	void			*sk_user_data;
-	u64			sk_trb_conn_id;
+	u64			sk_trb_sock_id;
+	struct trb_ids_allocator *sk_trb_ids;
+	void			(*sk_trb_saved_destruct)(struct sock *sk);
 #ifdef CONFIG_SECURITY
 	void			*sk_security;
 #endif
@@ -1209,8 +1212,6 @@ struct proto_accept_arg {
 	int err;
 	int is_empty;
 	bool kern;
-	bool set_trb_conn_id;
-	u64 trb_conn_id;
 };
 
 /* Networking protocol blocks we attach to sockets.

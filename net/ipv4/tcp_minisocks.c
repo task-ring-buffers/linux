@@ -20,6 +20,7 @@
  */
 
 #include <net/tcp.h>
+#include <net/trb.h>
 #include <net/xfrm.h>
 #include <net/busy_poll.h>
 #include <net/rstreason.h>
@@ -516,6 +517,7 @@ struct sock *tcp_create_openreq_child(const struct sock *sk,
 	struct inet_connection_sock *newicsk;
 	const struct tcp_sock *oldtp;
 	struct tcp_sock *newtp;
+	struct trb_ids_allocator *trb_ids;
 	u32 seq;
 
 	if (!newsk)
@@ -524,6 +526,20 @@ struct sock *tcp_create_openreq_child(const struct sock *sk,
 	newicsk = inet_csk(newsk);
 	newtp = tcp_sk(newsk);
 	oldtp = tcp_sk(sk);
+	trb_ids = READ_ONCE(sk->sk_trb_ids);
+
+	if (trb_ids) {
+		u32 trb_sock_id;
+
+		if (trb_id_alloc(trb_ids, &trb_sock_id)) {
+			bh_unlock_sock(newsk);
+			sock_put(newsk);
+			return NULL;
+		}
+
+		newsk->sk_trb_ids = trb_ids;
+		WRITE_ONCE(newsk->sk_trb_sock_id, trb_sock_id);
+	}
 
 	smc_check_reset_syn_req(oldtp, req, newtp);
 

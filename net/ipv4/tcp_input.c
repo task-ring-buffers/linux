@@ -4964,10 +4964,27 @@ static void tcp_ofo_queue(struct sock *sk)
 		eaten = tail && tcp_try_coalesce(sk, tail, skb, &fragstolen);
 		tcp_rcv_nxt_update(tp, TCP_SKB_CB(skb)->end_seq);
 		fin = TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN;
-		if (!eaten)
+		if (!eaten) {
+			if (skb->trb_pkt)
+				/* pr_warn("TRB ofo enqueue: conn_id=%llu skb=%px seq=%u end_seq=%u len=%u trb_pkt=%u head_ix=%u\n",
+					READ_ONCE(sk->sk_trb_sock_id), skb,
+					TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq,
+					skb->len, skb->trb_pkt, skb->trb_head_page_ix); */
 			__skb_queue_tail(&sk->sk_receive_queue, skb);
-		else
+		} else
 			kfree_skb_partial(skb, fragstolen);
+
+#ifdef CONFIG_TRB_RX_RING_DEV
+		if (skb->trb_pkt && !eaten) {
+			int trb_ret = trb_tcp_queue_skb(skb->trb_qctx, sk, skb);
+
+			if (trb_ret)
+				pr_warn("TRB OFO queue call failed: skb=%px ret=%d seq=%u end_seq=%u len=%u trb_pkt=%u head_ix=%u\n",
+					skb, trb_ret, TCP_SKB_CB(skb)->seq,
+					TCP_SKB_CB(skb)->end_seq, skb->len,
+					skb->trb_pkt, skb->trb_head_page_ix);
+		}
+#endif
 
 		if (unlikely(fin)) {
 			tcp_fin(sk);
@@ -5151,12 +5168,25 @@ static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb,
 {
 	int eaten;
 	struct sk_buff *tail = skb_peek_tail(&sk->sk_receive_queue);
+	u64 trb_sock_id = READ_ONCE(sk->sk_trb_sock_id);
 
 	eaten = (tail &&
 		 tcp_try_coalesce(sk, tail,
 				  skb, fragstolen)) ? 1 : 0;
+	if (eaten && skb->trb_pkt) {
+		/* pr_warn("TRB coalesced: conn_id=%llu from=%px from_seq=%u from_end=%u from_len=%u from_trb_pkt=%u from_head_ix=%u into tail=%px tail_seq=%u tail_end=%u tail_len=%u tail_trb_pkt=%u tail_head_ix=%u\n",
+			trb_sock_id, skb, TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq,
+			skb->len, skb->trb_pkt, skb->trb_head_page_ix,
+			tail, TCP_SKB_CB(tail)->seq, TCP_SKB_CB(tail)->end_seq,
+			tail->len, tail->trb_pkt, tail->trb_head_page_ix); */
+	}
 	tcp_rcv_nxt_update(tcp_sk(sk), TCP_SKB_CB(skb)->end_seq);
 	if (!eaten) {
+		if (skb->trb_pkt)
+			/* pr_warn("TRB queue_rcv enqueue: conn_id=%llu skb=%px seq=%u end_seq=%u len=%u trb_pkt=%u head_ix=%u\n",
+				trb_sock_id, skb, TCP_SKB_CB(skb)->seq,
+				TCP_SKB_CB(skb)->end_seq, skb->len,
+				skb->trb_pkt, skb->trb_head_page_ix); */
 		__skb_queue_tail(&sk->sk_receive_queue, skb);
 		skb_set_owner_r(skb, sk);
 	}
@@ -5288,6 +5318,10 @@ queue_and_out:
 		}
 
 		eaten = tcp_queue_rcv(sk, skb, &fragstolen);
+		if (trb_pkt && eaten > 0)
+			/* pr_warn("TRB skb eaten before queue: skb=%px qctx=%px seq=%u end_seq=%u len=%u\n",
+				skb, skb->trb_qctx, TCP_SKB_CB(skb)->seq,
+				TCP_SKB_CB(skb)->end_seq, skb->len); */
 		if (skb->len)
 			tcp_event_data_recv(sk, skb);
 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
@@ -5309,8 +5343,20 @@ queue_and_out:
 		tcp_fast_path_check(sk);
 
 #ifdef CONFIG_TRB_RX_RING_DEV
-		if (trb_pkt) {
-			if (!trb_tcp_queue_skb(skb->trb_qctx, sk, skb))
+		if (trb_pkt && !eaten) {
+			/* pr_warn("TCP about to call TRB hook: conn_id=%llu skb=%px seq=%u end_seq=%u len=%u trb_pkt=%u head_ix=%u\n",
+				READ_ONCE(sk->sk_trb_sock_id), skb,
+				TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq,
+				skb->len, skb->trb_pkt, skb->trb_head_page_ix); */
+			int trb_ret = trb_tcp_queue_skb(skb->trb_qctx, sk, skb);
+
+			if (trb_ret)
+				pr_warn("TRB queue call failed: skb=%px ret=%d eaten=%d seq=%u end_seq=%u len=%u trb_pkt=%u head_ix=%u\n",
+					skb, trb_ret, eaten, TCP_SKB_CB(skb)->seq,
+					TCP_SKB_CB(skb)->end_seq, skb->len,
+					skb->trb_pkt, skb->trb_head_page_ix);
+
+			if (!trb_ret)
 				return;
 		}
 #endif
@@ -6198,6 +6244,9 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 		} else {
 			int eaten = 0;
 			bool fragstolen = false;
+#ifdef CONFIG_TRB_RX_RING_DEV
+			bool trb_pkt = READ_ONCE(skb->trb_pkt);
+#endif
 
 			if (tcp_checksum_complete(skb))
 				goto csum_error;
@@ -6239,6 +6288,16 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 no_ack:
 			if (eaten)
 				kfree_skb_partial(skb, fragstolen);
+#ifdef CONFIG_TRB_RX_RING_DEV
+			if (trb_pkt && !eaten) {
+				/* pr_warn("TCP fast path about to call TRB hook: conn_id=%llu skb=%px seq=%u end_seq=%u len=%u trb_pkt=%u head_ix=%u\n",
+					READ_ONCE(sk->sk_trb_sock_id), skb,
+					TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq,
+					skb->len, skb->trb_pkt, skb->trb_head_page_ix); */
+				if (!trb_tcp_queue_skb(skb->trb_qctx, sk, skb))
+					return;
+			}
+#endif
 			tcp_data_ready(sk);
 			return;
 		}

@@ -9,6 +9,7 @@
 #include <linux/eventfd.h>
 #include <linux/vmalloc.h>
 #include <linux/init.h>
+#include <linux/net.h>
 #include <linux/netdevice.h>
 #include <net/page_pool/types.h>
 #include <net/page_pool/helpers.h>
@@ -21,18 +22,22 @@
 #include <linux/mutex.h>
 #include <linux/list.h>
 
+#include "trb_ids.h"
+
 #define META_PAGES 3
 #define VM_TOTAL_PAGES 256
 #define DEV_NAME "trb_dev"
 
 /* Ring capacity must be powers of two for mask-based indexing */
 #define DESC_CAP 64     /* kernel -> user descriptors */
-#define FILL_CAP 256     /* user -> kernel buf_id ring */  /* should the size equal desc size or num_buffers */
+/* Ring capacity must stay power-of-two because rr_pop/rr_push use mask indexing. */
+#define FILL_CAP 512    /* user -> kernel buf_id ring */
 
 /* Switch to pp_frag for sub_page buffers */
 #define BUF_SIZE PAGE_SIZE
 
 #define TRB_DESC_F_CLOSE 0x1
+#define TRB_MAX_SOCK_IDS 65536
 
 
 struct trb_efd_req {
@@ -41,11 +46,16 @@ struct trb_efd_req {
 	__s32 efd_fd;
 };
 
+struct trb_listener_req {
+	__s32 listener_fd;
+};
+
 #define IOCTL_REGISTER_EFD _IOW('m', 1, struct trb_efd_req)
 
 #define IOCTL_TEST_PRODUCE _IOW('m', 2, u32)
 #define IOCTL_SET_NUM_QS _IOW('m', 3, __u16)
 #define IOCTL_TRB_CONFIG _IOW('m', 4, struct trb_cfg_req)
+#define IOCTL_REGISTER_LISTENER _IOW('m', 5, struct trb_listener_req)
 
 struct trb_cfg_req {
 	char ifname[IFNAMSIZ];
@@ -74,7 +84,7 @@ struct rx_ring_hdr {
 };
 
 struct trb_desc {
-	__u64 conn_id; /* app-provided connection id from accept5() */
+	__u64 conn_id; /* kernel-assigned TRB connection id */
 	__u32 buf_id; /* index into payload buffers (0 ... buf_cap - 1) */
 	__u32 len;    /* valid bytes starting at off */
 	__u32 off;    /* byte offset within the buffer */
@@ -123,25 +133,41 @@ struct buf_map_entry {
 struct queue_ctx;
 
 struct trb_dev {
-    
-    struct miscdevice misc;
-    u16 total_qs;
-    u16 qctx_cap;
-    struct queue_ctx **qctx_by_rq;
-    struct mutex qctx_lock;
+	struct miscdevice misc;
+	u16 total_qs;
+	u16 qctx_cap;
+	struct queue_ctx **qctx_by_rq;
+	struct mutex qctx_lock;
+	struct trb_ids_allocator *sock_ids;
 
-    /* Vmalloc-ed meta root + per-queue ring pointer tables */
-    void *meta_base;
-    size_t meta_bytes;
-    struct rx_ring_hdr *hdr;
-    struct descriptor_ring **dr_by_qid;
-    struct recycle_ring **rr_by_qid;
+	/* Vmalloc-ed meta root + per-queue ring pointer tables */
+	void *meta_base;
+	size_t meta_bytes;
+	struct rx_ring_hdr *hdr;
+	struct descriptor_ring **dr_by_qid;
+	struct recycle_ring **rr_by_qid;
 	atomic_t mmap_cnt;
 	struct list_head pending_qctx;
 
-    /* Payload backing via page_pool */
+	/* Payload backing via page_pool */
 
 };
+
+static void trb_sock_destruct(struct sock *sk)
+{
+	if (sk->sk_trb_ids && sk->sk_trb_sock_id) {
+		trb_id_free(sk->sk_trb_ids, (u32)sk->sk_trb_sock_id);
+		sk->sk_trb_sock_id = 0;
+		sk->sk_trb_ids = NULL;
+	}
+
+	if (sk->sk_trb_saved_destruct) {
+		void (*saved_destruct)(struct sock *sk) = sk->sk_trb_saved_destruct;
+
+		sk->sk_trb_saved_destruct = NULL;
+		saved_destruct(sk);
+	}
+}
 
 struct queue_ctx {
 	struct trb_dev *dev;
@@ -203,6 +229,7 @@ static void trb_dev_destroy(struct trb_dev *dev)
 	kfree(dev->dr_by_qid);
 	kfree(dev->rr_by_qid);
 	vfree(dev->meta_base);
+	trb_ids_destroy(dev->sock_ids);
 	kfree(dev);
 }
 
@@ -470,6 +497,8 @@ int trb_free_ring_return_ctx(struct queue_ctx *qctx,
 	entry->page = page;
 	entry->page_ix = idx;
 	smp_store_release(&ring->prod, prod + 1);
+	/* pr_warn("TRB free ring return: qid=%u page=%px page_ix=%u prod=%u con=%u cap=%u\n",
+		qctx->qid, page, idx, prod + 1, READ_ONCE(ring->con), ring->cap); */
 	return 0;
 }
 EXPORT_SYMBOL_GPL(trb_free_ring_return_ctx);
@@ -485,19 +514,19 @@ static inline void trb_buf_put_page(struct queue_ctx *qctx, __u32 buf_id)
 
 	ret = page_pool_unref_page(b->page, 1);
 	if (ret) {
-		pr_warn("TRB put path=drain_rr page_ix=%u ref_after=%ld to_free_ring=0\n",
-			b->page_ix, ret);
+		/* pr_warn("TRB put path=drain_rr page_ix=%u ref_after=%ld to_free_ring=0\n",
+			b->page_ix, ret); */
 		return;
 	}
 
 	if (!trb_free_ring_return_ctx(qctx, b->page, b->page_ix)) {
-		pr_warn("TRB put path=drain_rr page_ix=%u ref_after=0 to_free_ring=1\n",
-			b->page_ix);
+		/* pr_warn("TRB put path=drain_rr page_ix=%u ref_after=0 to_free_ring=1\n",
+			b->page_ix); */
 		return;
 	}
 
-	pr_warn("TRB put path=drain_rr page_ix=%u ref_after=0 to_free_ring=0\n",
-		b->page_ix);
+	/* pr_warn("TRB put path=drain_rr page_ix=%u ref_after=0 to_free_ring=0\n",
+		b->page_ix); */
 	page_pool_put_unrefed_page(qctx->pp, b->page, -1, false);
 }
 
@@ -864,6 +893,33 @@ static long trb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 		return ret;
 	}
+	case IOCTL_REGISTER_LISTENER: {
+		struct trb_listener_req req;
+		struct socket *sock;
+		struct sock *sk;
+		int err = 0;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+
+		sock = sockfd_lookup(req.listener_fd, &err);
+		if (!sock)
+			return err;
+
+		sk = sock->sk;
+		if (!sk) {
+			sockfd_put(sock);
+			return -ENODEV;
+		}
+
+		if (sk->sk_trb_ids && sk->sk_trb_ids != dev->sock_ids)
+			err = -EBUSY;
+		else
+			sk->sk_trb_ids = dev->sock_ids;
+
+		sockfd_put(sock);
+		return err;
+	}
 	default:
 		return -ENOIOCTLCMD;
 	}
@@ -880,6 +936,11 @@ static int trb_open(struct inode *ino, struct file *file)
 		return -ENOMEM;
 
 	mutex_init(&dev->qctx_lock);
+	dev->sock_ids = trb_ids_create(TRB_MAX_SOCK_IDS, GFP_KERNEL);
+	if (!dev->sock_ids) {
+		kfree(dev);
+		return -ENOMEM;
+	}
 	atomic_set(&dev->mmap_cnt, 0);
 	INIT_LIST_HEAD(&dev->pending_qctx);
 	file->private_data = dev;
@@ -923,7 +984,7 @@ static int __init trb_init(void)
     if (ret) {
         return ret;
     }
-    pr_info("%s: registered (deferred init)", DEV_NAME);
+    /* pr_info("%s: registered (deferred init)", DEV_NAME); */
 	return 0;
 }
 
@@ -1078,8 +1139,8 @@ static int trb_emit_segments_pp_one(struct queue_ctx *qctx, struct sk_buff *skb,
 		if (trb_buf_from_region(qctx, page_ix, head_page, payload_start,
 					head_len, &buf_id, &off, &seg_len))
 			return -EINVAL;
-		pr_warn("TRB emit head: page_ix=%u buf_id=%u off=%u len=%u payload_start=%u buf_size=%u\n",
-			page_ix, buf_id, off, seg_len, payload_start, dr->buf_size);
+		/* pr_warn("TRB emit head: page_ix=%u buf_id=%u off=%u len=%u payload_start=%u buf_size=%u\n",
+			page_ix, buf_id, off, seg_len, payload_start, dr->buf_size); */
 
 			td = &dr->descs[(prod + *seg_idx) & (dr->desc_cap - 1)];
 				WRITE_ONCE(td->conn_id, conn_id);
@@ -1087,10 +1148,10 @@ static int trb_emit_segments_pp_one(struct queue_ctx *qctx, struct sk_buff *skb,
 				WRITE_ONCE(td->len, seg_len);
 				WRITE_ONCE(td->off, off);
 				WRITE_ONCE(td->flags, 0);
-			pr_warn("TRB emit store head: buf_id=%u skb=%px users=%d active_ext=%u ext=%px trb_pkt=%u trb_head_ix=%u\n",
+			/* pr_warn("TRB emit store head: buf_id=%u skb=%px users=%d active_ext=%u ext=%px trb_pkt=%u trb_head_ix=%u\n",
 				buf_id, skb, refcount_read(&skb->users),
 				skb->active_extensions, skb->extensions,
-				skb->trb_pkt, skb->trb_head_page_ix);
+				skb->trb_pkt, skb->trb_head_page_ix); */
 			page_pool_ref_page(qctx->bufs[buf_id].page);
 			qctx->bufs[buf_id].inflight++;
 			(*seg_idx)++;
@@ -1110,8 +1171,8 @@ static int trb_emit_segments_pp_one(struct queue_ctx *qctx, struct sk_buff *skb,
 					skb_frag_size(&sh->frags[i]),
 					&buf_id, &off, &seg_len))
 			return -EINVAL;
-		pr_warn("TRB emit frag: page_ix=%u buf_id=%u off=%u len=%u payload_start=%u buf_size=%u\n",
-			page_ix, buf_id, off, seg_len, payload_start, dr->buf_size);
+		/* pr_warn("TRB emit frag: page_ix=%u buf_id=%u off=%u len=%u payload_start=%u buf_size=%u\n",
+			page_ix, buf_id, off, seg_len, payload_start, dr->buf_size); */
 
 			td = &dr->descs[(prod + *seg_idx) & (dr->desc_cap - 1)];
 				WRITE_ONCE(td->conn_id, conn_id);
@@ -1119,17 +1180,17 @@ static int trb_emit_segments_pp_one(struct queue_ctx *qctx, struct sk_buff *skb,
 				WRITE_ONCE(td->len, seg_len);
 				WRITE_ONCE(td->off, off);
 				WRITE_ONCE(td->flags, 0);
-			pr_warn("TRB emit store frag: buf_id=%u skb=%px users=%d active_ext=%u ext=%px trb_pkt=%u trb_head_ix=%u\n",
+			/* pr_warn("TRB emit store frag: buf_id=%u skb=%px users=%d active_ext=%u ext=%px trb_pkt=%u trb_head_ix=%u\n",
 				buf_id, skb, refcount_read(&skb->users),
 				skb->active_extensions, skb->extensions,
-				skb->trb_pkt, skb->trb_head_page_ix);
+				skb->trb_pkt, skb->trb_head_page_ix); */
 			page_pool_ref_page(qctx->bufs[buf_id].page);
 			qctx->bufs[buf_id].inflight++;
 			(*seg_idx)++;
 		}
 
 		skb_walk_frags(skb, frag_skb) {
-	        pr_warn("Walking SKB frags\n");
+	        /* pr_warn("Walking SKB frags\n"); */
 			int err = trb_emit_segments_pp_one(qctx, frag_skb, prod, seg_idx,
 							    conn_id);
 			if (err)
@@ -1168,12 +1229,17 @@ int trb_tcp_queue_skb(struct queue_ctx *qctx, struct sock *sk,
 	u32 total_bytes;
 	bool close_desc;
 
+	/* pr_warn("TRB queue enter: qctx=%px sk=%px skb=%px seq=%u end_seq=%u len=%u trb_pkt=%u head_ix=%u\n",
+		qctx, sk, skb, skb ? TCP_SKB_CB(skb)->seq : 0,
+		skb ? TCP_SKB_CB(skb)->end_seq : 0, skb ? skb->len : 0,
+		skb ? skb->trb_pkt : 0, skb ? skb->trb_head_page_ix : 0); */
+
 	if (!qctx || !qctx->dr || !qctx->pp || !qctx->bufs || !skb)
 		return -ENODEV;
 
 	dr = qctx->dr;
 	tp = tcp_sk(sk);
-	conn_id = READ_ONCE(sk->sk_trb_conn_id);
+	conn_id = READ_ONCE(sk->sk_trb_sock_id);
 
 	con = smp_load_acquire(&dr->con);
 	prod = READ_ONCE(dr->prod);

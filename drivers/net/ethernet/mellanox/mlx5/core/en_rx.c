@@ -2263,7 +2263,7 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 
 	lg = &(skb->log);
 	if (log) {
-		printk("log 200 found and rqn is %u", rq->rqn);
+		/* printk("log 200 found and rqn is %u", rq->rqn); */
 		lg->log_mark = 1;
 		lg->log_id = log_id_exp1++;
 		tsclog_2(ukl_tsc_log, lg->log_id, 100);
@@ -2273,9 +2273,9 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 	skb_mark_for_recycle(skb);
 #ifdef CONFIG_TRB_RX_RING_DEV
 	if (rq->priv->channels.params.trb_enabled && rq->ix != 0)
-		pr_warn("TRB pre-set head idx: skb=%px active_ext=%u ext=%px trb_pkt=%u trb_head_ix=%u\n",
+		/* pr_warn("TRB pre-set head idx: skb=%px active_ext=%u ext=%px trb_pkt=%u trb_head_ix=%u\n",
 			skb, skb->active_extensions, skb->extensions,
-			skb->trb_pkt, skb->trb_head_page_ix);
+			skb->trb_pkt, skb->trb_head_page_ix); */
 	skb->trb_head_page_ix = frag_page->trb_page_ix;
 #endif
 	frag_page->frags++;
@@ -2820,9 +2820,10 @@ int mlx5e_rq_set_handlers(struct mlx5e_rq *rq, struct mlx5e_params *params, bool
 			return -EINVAL;
 		}
 	}
-	if (params->trb_enabled && rq->ix != 0)
-		pr_warn("TRB skb builder: rq=%d wq_type=%u fn=%ps\n",
-			rq->ix, rq->wq_type, skb_builder);
+	if (params->trb_enabled && rq->ix != 0) {
+		/* pr_warn("TRB skb builder: rq=%d wq_type=%u fn=%ps\n",
+			rq->ix, rq->wq_type, skb_builder); */
+	}
 
 	return 0;
 }

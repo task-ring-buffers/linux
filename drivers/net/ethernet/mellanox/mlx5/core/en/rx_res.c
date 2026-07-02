@@ -3,6 +3,7 @@
 
 #include "rx_res.h"
 #include "channels.h"
+#include "en_trb.h"
 #include "params.h"
 
 #define MLX5E_MAX_NUM_RSS 16
@@ -423,10 +424,24 @@ void destroy_trb_res(struct mlx5e_rx_res *res, unsigned int nch)
 	res->trb_channel_res = NULL;
 }
 
-int mlx5e_trb_res_create(struct mlx5e_rx_res *res, unsigned  int nch)
+static enum mlx5_traffic_types mlx5e_trb_tt_from_fs_type(u8 trb_fs_type)
+{
+	switch (trb_fs_type) {
+	case TRB_FS_IPV4_TCP:
+		return MLX5_TT_IPV4_TCP;
+	case TRB_FS_IPV4_UDP:
+	default:
+		return MLX5_TT_IPV4_UDP;
+	}
+}
+
+int mlx5e_trb_res_create(struct mlx5e_rx_res *res, unsigned int nch,
+			 u8 trb_fs_type)
 {
 	struct mlx5e_tir_builder *builder;
+	struct mlx5e_rss_params_hash rss_hash;
 	struct mlx5e_rss_params_indir indir;
+	enum mlx5_traffic_types trb_tt;
 	u32 app_nch;
 	u32 rqt_sz;
 	int err = 0;
@@ -439,6 +454,9 @@ int mlx5e_trb_res_create(struct mlx5e_rx_res *res, unsigned  int nch)
 	builder = mlx5e_tir_builder_alloc(false);
 	if (!builder)
 		return -ENOMEM;
+
+	trb_tt = mlx5e_trb_tt_from_fs_type(trb_fs_type);
+	rss_hash = mlx5e_rss_get_hash(res->rss[0]);
 
 	res->trb_channel_res = kvcalloc(2, sizeof(*res->trb_channel_res), GFP_KERNEL);
 	if (!res->trb_channel_res) {
@@ -478,7 +496,15 @@ int mlx5e_trb_res_create(struct mlx5e_rx_res *res, unsigned  int nch)
 					    mlx5e_rqt_get_rqtn(&res->trb_channel_res[ix].trb_rqt),
 					    false);
 		mlx5e_tir_builder_build_packet_merge(builder, &res->pkt_merge_param);
-		mlx5e_tir_builder_build_direct(builder);
+		if (ix == 0) {
+			/* Default traffic stays pinned to q0. */
+			mlx5e_tir_builder_build_direct(builder);
+		} else {
+			struct mlx5e_rss_params_traffic_type rss_tt;
+
+			rss_tt = mlx5e_rss_get_default_tt_config(trb_tt);
+			mlx5e_tir_builder_build_rss(builder, &rss_hash, &rss_tt, false);
+		}
 
 		err = mlx5e_tir_init(&res->trb_channel_res[ix].trb_tir, builder,
 				     res->mdev, true);

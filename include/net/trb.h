@@ -8,6 +8,7 @@
 
 struct queue_ctx;
 struct trb_dev;
+struct trb_ids_allocator;
 struct sock;
 struct sk_buff;
 
@@ -18,6 +19,8 @@ struct page_pool *trb_register_pp(struct page_pool_params *pp, size_t buf_size,
 				  struct queue_ctx **out_qctx);
 struct page *trb_page_pool_alloc(struct queue_ctx *qctx, u32 *idx);
 int trb_free_ring_return_ctx(struct queue_ctx *qctx, struct page *page, u32 idx);
+int trb_id_alloc(struct trb_ids_allocator *alloc, u32 *id_out);
+void trb_id_free(struct trb_ids_allocator *alloc, u32 id);
 int trb_tcp_queue_skb(struct queue_ctx *qctx, struct sock *sk,
 		      struct sk_buff *skb);
 void trb_unregister_qctx(struct queue_ctx *qctx);
@@ -45,6 +48,17 @@ static inline int trb_free_ring_return_ctx(struct queue_ctx *qctx, struct page *
 	(void)page;
 	(void)idx;
 	return -EOPNOTSUPP;
+}
+static inline int trb_id_alloc(struct trb_ids_allocator *alloc, u32 *id_out)
+{
+	(void)alloc;
+	(void)id_out;
+	return -EOPNOTSUPP;
+}
+static inline void trb_id_free(struct trb_ids_allocator *alloc, u32 id)
+{
+	(void)alloc;
+	(void)id;
 }
 static inline int trb_tcp_queue_skb(struct queue_ctx *qctx, struct sock *sk,
 				    struct sk_buff *skb)

@@ -1953,9 +1953,6 @@ struct file *do_accept(struct file *file, struct proto_accept_arg *arg,
 	if (err < 0)
 		goto out_fd;
 
-	if (arg->set_trb_conn_id && newsock->sk)
-		WRITE_ONCE(newsock->sk->sk_trb_conn_id, arg->trb_conn_id);
-
 	if (upeer_sockaddr) {
 		len = ops->getname(newsock, (struct sockaddr *)&address, 2);
 		if (len < 0) {
@@ -2004,14 +2001,12 @@ static int __sys_accept4_file(struct file *file, struct sockaddr __user *upeer_s
 
 static int __sys_accept5_file(struct file *file, struct sockaddr __user *upeer_sockaddr,
 			      int __user *upeer_addrlen, int flags,
-			      u64 trb_conn_id)
+			      u64 __user *trb_conn_id)
 {
-	struct proto_accept_arg arg = {
-		.set_trb_conn_id = true,
-		.trb_conn_id = trb_conn_id,
-	};
+	struct proto_accept_arg arg = { };
 	struct file *newfile;
 	int newfd;
+	u64 trb_sock_id;
 
 	if (flags & ~(SOCK_CLOEXEC | SOCK_NONBLOCK))
 		return -EINVAL;
@@ -2031,6 +2026,16 @@ static int __sys_accept5_file(struct file *file, struct sockaddr __user *upeer_s
 		put_unused_fd(newfd);
 		return PTR_ERR(newfile);
 	}
+
+	trb_sock_id = newfile->private_data &&
+		      ((struct socket *)newfile->private_data)->sk ?
+		      READ_ONCE(((struct socket *)newfile->private_data)->sk->sk_trb_sock_id) : 0;
+	if (put_user(trb_sock_id, trb_conn_id)) {
+		fput(newfile);
+		put_unused_fd(newfd);
+		return -EFAULT;
+	}
+
 	fd_install(newfd, newfile);
 	return newfd;
 }
@@ -2064,7 +2069,8 @@ int __sys_accept4(int fd, struct sockaddr __user *upeer_sockaddr,
 }
 
 static int __sys_accept5(int fd, struct sockaddr __user *upeer_sockaddr,
-			 int __user *upeer_addrlen, int flags, u64 trb_conn_id)
+			 int __user *upeer_addrlen, int flags,
+			 u64 __user *trb_conn_id)
 {
 	int ret = -EBADF;
 	struct fd f;
@@ -2086,7 +2092,7 @@ SYSCALL_DEFINE4(accept4, int, fd, struct sockaddr __user *, upeer_sockaddr,
 }
 
 SYSCALL_DEFINE5(accept5, int, fd, struct sockaddr __user *, upeer_sockaddr,
-		int __user *, upeer_addrlen, int, flags, u64, trb_conn_id)
+		int __user *, upeer_addrlen, int, flags, u64 __user *, trb_conn_id)
 {
 	return __sys_accept5(fd, upeer_sockaddr, upeer_addrlen, flags,
 			     trb_conn_id);

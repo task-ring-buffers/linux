@@ -752,7 +752,7 @@ asmlinkage long sys_bind(int, struct sockaddr __user *, int);
 asmlinkage long sys_listen(int, int);
 asmlinkage long sys_accept(int, struct sockaddr __user *, int __user *);
 asmlinkage long sys_accept5(int, struct sockaddr __user *, int __user *, int,
-			    u64);
+			    u64 __user *);
 asmlinkage long sys_connect(int, struct sockaddr __user *, int);
 asmlinkage long sys_getsockname(int, struct sockaddr __user *, int __user *);
 asmlinkage long sys_getpeername(int, struct sockaddr __user *, int __user *);

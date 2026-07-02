@@ -3317,8 +3317,10 @@ trb_activate:
 	mlx5e_activate_priv_channels(priv);
 	
 	if(!err && priv->channels.params.trb_enabled){
-		pr_warn("TRB_ENABLED detected\n");
-		err = mlx5e_trb_res_create(priv->rx_res, priv->channels.params.num_channels);
+		/* pr_warn("TRB_ENABLED detected\n"); */
+			err = mlx5e_trb_res_create(priv->rx_res,
+						   priv->channels.params.num_channels,
+						   priv->channels.params.trb_fs_type);
 		if (err) {
 			pr_warn("Failed to create trb resources\n");
 			//priv->channels = old_chs;
@@ -6072,11 +6074,11 @@ mlx5e_calc_max_nch(struct mlx5_core_dev *mdev, struct net_device *netdev,
 	/* core resources */
 	max_nch = mlx5e_profile_max_num_channels(mdev, profile);
 	
-	pr_warn("Core resources no of channels : %d\n", max_nch);
+	/* pr_warn("Core resources no of channels : %d\n", max_nch); */
 	/* netdev rx queues */
 	max_nch = min_t(unsigned int, max_nch, netdev->num_rx_queues);
 
-	pr_warn("Netdev rx queues no of channels : %d\n", netdev->num_rx_queues);
+	/* pr_warn("Netdev rx queues no of channels : %d\n", netdev->num_rx_queues); */
 
 	/* netdev tx queues */
 	tmp = netdev->num_tx_queues;
@@ -6087,7 +6089,7 @@ mlx5e_calc_max_nch(struct mlx5_core_dev *mdev, struct net_device *netdev,
 	tmp = tmp / profile->max_tc;
 	max_nch = min_t(unsigned int, max_nch, tmp);
 	
-	pr_warn("Tmp no of channels : %d", tmp);
+	/* pr_warn("Tmp no of channels : %d", tmp); */
 	return max_nch;
 }
 

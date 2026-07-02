@@ -175,7 +175,7 @@ int trb_create_groups(struct mlx5e_trb_table *trb, enum trb_fs_types type)
 	if (IS_ERR(trb->g[trb->num_groups]))
 			goto err;
 
-	pr_warn("Created the custom group\n");
+	/* pr_warn("Created the custom group\n"); */
 	trb->num_groups++;
 
 	/*Default Flow Group */
@@ -186,7 +186,7 @@ int trb_create_groups(struct mlx5e_trb_table *trb, enum trb_fs_types type)
 	trb->g[trb->num_groups] = mlx5_create_flow_group(trb->t, in);
 	if (IS_ERR(trb->g[trb->num_groups]))
 		goto err;
-	pr_warn("Created the default group\n");
+	/* pr_warn("Created the default group\n"); */
 	trb->num_groups++;
 
 	kvfree(in);
@@ -282,5 +282,4 @@ err:
 	return err;
 
 }
-
 

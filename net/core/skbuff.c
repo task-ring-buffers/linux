@@ -1057,19 +1057,19 @@ static bool skb_trb_pp_put_page(struct queue_ctx *qctx, struct page *page, u32 p
 
 	ret = page_pool_unref_page(page, 1);
 	if (ret) {
-		pr_warn("TRB put path=stack page_ix=%u ref_after=%ld to_free_ring=0\n",
-			page_ix, ret);
+		/* pr_warn("TRB put path=stack page_ix=%u ref_after=%ld to_free_ring=0\n",
+			page_ix, ret); */
 		return true;
 	}
 
 	if (!trb_free_ring_return_ctx(qctx, page, page_ix)) {
-		pr_warn("TRB put path=stack page_ix=%u ref_after=0 to_free_ring=1\n",
-			page_ix);
+		/* pr_warn("TRB put path=stack page_ix=%u ref_after=0 to_free_ring=1\n",
+			page_ix); */
 		return true;
 	}
 
-	pr_warn("TRB put path=stack page_ix=%u ref_after=0 to_free_ring=0\n",
-		page_ix);
+	/* pr_warn("TRB put path=stack page_ix=%u ref_after=0 to_free_ring=0\n",
+		page_ix); */
 
 	page_pool_put_unrefed_page(pool, page, -1, false);
 	return true;
@@ -1237,9 +1237,9 @@ static void skb_release_all(struct sk_buff *skb, enum skb_drop_reason reason)
 {
 #ifdef CONFIG_TRB_RX_RING_DEV
 	if (skb->trb_pkt)
-		pr_warn("TRB skb free: skb=%px users=%d active_ext=%u ext=%px trb_pkt=%u trb_head_ix=%u\n",
+		/* pr_warn("TRB skb free: skb=%px users=%d active_ext=%u ext=%px trb_pkt=%u trb_head_ix=%u\n",
 			skb, refcount_read(&skb->users), skb->active_extensions,
-			skb->extensions, skb->trb_pkt, skb->trb_head_page_ix);
+			skb->extensions, skb->trb_pkt, skb->trb_head_page_ix); */
 #endif
 	skb_release_head_state(skb);
 	if (likely(skb->head))
@@ -6117,7 +6117,7 @@ bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
 		skb_fill_page_desc(to, to_shinfo->nr_frags,
 				   page, offset, skb_headlen(from));
 #ifdef CONFIG_TRB_RX_RING_DEV
-        pr_warn("Coalescing trb_idx %u \n", from->trb_head_page_ix);
+        /* pr_warn("Coalescing trb_idx %u \n", from->trb_head_page_ix); */
 		to_shinfo->trb_page_ix[to_shinfo->nr_frags] = from->trb_head_page_ix;
 #endif
 		*fragstolen = true;
@@ -7148,7 +7148,6 @@ void __skb_ext_put(struct skb_ext *ext)
 	/* If this is last clone, nothing can increment
 	 * it after check passes.  Avoids one atomic op.
 	 */
-    pr_warn("SKB EXT OUT BUG PLACE 1\n");
 	if (refcount_read(&ext->refcnt) == 1)
 		goto free_now;
 
@@ -7156,7 +7155,6 @@ void __skb_ext_put(struct skb_ext *ext)
 		return;
 free_now:
 #ifdef CONFIG_XFRM
-    pr_warn("SKB EXT OUT BUG PLACE 2\n");
 	if (__skb_ext_exist(ext, SKB_EXT_SEC_PATH))
 		skb_ext_put_sp(skb_ext_get_ptr(ext, SKB_EXT_SEC_PATH));
 #endif
@@ -7164,7 +7162,6 @@ free_now:
 	if (__skb_ext_exist(ext, SKB_EXT_MCTP))
 		skb_ext_put_mctp(skb_ext_get_ptr(ext, SKB_EXT_MCTP));
 #endif
-    pr_warn("SKB EXT OUT BUG PLACE 3\n");
 
 	kmem_cache_free(skbuff_ext_cache, ext);
 }
