@@ -2688,8 +2688,6 @@ static int mlx5e_open_channel(struct mlx5e_priv *priv, int ix,
 
 	mdev = mlx5_sd_ch_ix_get_dev(priv->mdev, ix);
 	vec_ix = mlx5_sd_ch_ix_get_vec_ix(mdev, ix);
-	mlx5_core_warn(mdev, "open_channel: ix=%d vec_ix=%d num_channels=%u\n",
-		       ix, vec_ix, params->num_channels);
 	cpu = mlx5_comp_vector_get_cpu(mdev, vec_ix);
 
 	err = mlx5_comp_irqn_get(mdev, vec_ix, &irq);
