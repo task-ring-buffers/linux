@@ -66,7 +66,6 @@ struct ipq {
 	int             iif;
 	unsigned int    rid;
 	struct inet_peer *peer;
-	struct log_info *log;
 };
 
 static u8 ip4_frag_ecn(u8 tos)
@@ -283,8 +282,6 @@ static int ip_frag_queue(struct ipq *qp, struct sk_buff *skb)
 	int err = -ENOENT;
 	SKB_DR(reason);
 	u8 ecn;
-	struct log_info *lg;
-
 	/* If reassembly is already done, @skb must be a duplicate frag. */
 	if (qp->q.flags & INET_FRAG_COMPLETE) {
 		SKB_DR_SET(reason, DUP_FRAG);
@@ -317,11 +314,8 @@ static int ip_frag_queue(struct ipq *qp, struct sk_buff *skb)
 		if (end < qp->q.len ||
 		    ((qp->q.flags & INET_FRAG_LAST_IN) && end != qp->q.len))
 			goto discard_qp;
-		qp->q.flags |= INET_FRAG_LAST_IN;
-		qp->q.len = end;
-		lg = &(skb->log);
-		lg->log_mark = qp->log->log_mark;
-		lg->log_id = qp->log->log_id;
+			qp->q.flags |= INET_FRAG_LAST_IN;
+			qp->q.len = end;
 	} else {
 		if (end&7) {
 			end &= ~7;
@@ -365,7 +359,6 @@ static int ip_frag_queue(struct ipq *qp, struct sk_buff *skb)
 	qp->ecn |= ecn;
 	add_frag_mem_limit(qp->q.fqdir, skb->truesize);
 	if (offset == 0){
-		qp->log = &(skb->log);
 		qp->q.flags |= INET_FRAG_FIRST_IN;
 	}
 

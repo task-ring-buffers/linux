@@ -26,13 +26,6 @@
 #include "nic.h"
 #include "selftest.h"
 #include "workarounds.h"
-#include <linux/tsc_logger.h>
-#include <linux/if_ether.h>
-#include <linux/netdevice.h>
-#include <linux/printk.h>
-#include <linux/highmem.h>
-
-
 /* Preferred number of descriptors to fill at once */
 #define EFX_RX_PREFERRED_BATCH 8U
 
@@ -46,9 +39,6 @@
 #define EFX_RX_MAX_FRAGS DIV_ROUND_UP(EFX_MAX_FRAME_LEN(EFX_MAX_MTU), \
 				      EFX_RX_USR_BUF_SIZE)
 
-uint64_t log_id = 1;
-
-extern struct TscLog *ukl_tsc_log;
 static void efx_rx_packet__check_len(struct efx_rx_queue *rx_queue,
 				     struct efx_rx_buffer *rx_buf,
 				     int len)
@@ -80,8 +70,6 @@ static struct sk_buff *efx_rx_mk_skb(struct efx_channel *channel,
 {
 	struct efx_nic *efx = channel->efx;
 	struct sk_buff *skb;
-	struct log_info *log;
-
 	/* Allocate an SKB to store the headers */
 	skb = netdev_alloc_skb(efx->net_dev,
 			       efx->rx_ip_align + efx->rx_prefix_size +
@@ -124,9 +112,6 @@ static struct sk_buff *efx_rx_mk_skb(struct efx_channel *channel,
 	skb->protocol = eth_type_trans(skb, efx->net_dev);
 
 	skb_mark_napi_id(skb, &channel->napi_str);
-
-	log = &(skb->log);
-	log->log_mark = 0;
 
 	return skb;
 }
@@ -218,54 +203,12 @@ void efx_rx_packet(struct efx_rx_queue *rx_queue, unsigned int index,
 	channel->rx_pkt_index = index;
 }
 
-int tsclog_port_check(struct efx_rx_buffer *rx_buf, int proto, u32 port)
-{
-	void *packet_data = page_address(rx_buf->page) + rx_buf->page_offset;
-	struct ethhdr *eth = (struct ethhdr *) packet_data;
-	struct iphdr *ip;
-	struct udphdr *udp;
-	struct tcphdr *tcp;
-	u16 dport;
-	if(eth->h_proto == htons(ETH_P_IP)) {
-		ip = (struct iphdr *) (eth + 1);
-		if (ip->protocol == proto){
-			if (proto == IPPROTO_UDP) {
-				udp = (struct udphdr *) ((char *)ip + (ip->ihl *4));
-				dport = ntohs(udp->dest);
-				if (dport == port)
-					return 1;
-				else
-					return 0;
-			}
-			else if (proto == IPPROTO_TCP) {
-				tcp = (struct tcphdr *) ((char *)ip + (ip->ihl *4));
-                                dport = ntohs(tcp->dest);
-                                if (dport == port)
-                                        return 1;
-                                else
-                                        return 0;
-
-			}
-		}
-		else {
-			return 0;
-		}
-
-	}
-	return 0;
-
-}
-
 static void efx_rx_deliver(struct efx_channel *channel, u8 *eh,
 			   struct efx_rx_buffer *rx_buf,
 			   unsigned int n_frags)
 {
 	struct sk_buff *skb;
 	u16 hdr_len = min_t(u16, rx_buf->len, EFX_SKB_HEADERS);
-	struct log_info *lg;
-	int log;
-
-	log = tsclog_port_check(rx_buf, IPPROTO_UDP, 8080);
 
 	skb = efx_rx_mk_skb(channel, rx_buf, n_frags, eh, hdr_len);
 	if (unlikely(skb == NULL)) {
@@ -275,13 +218,6 @@ static void efx_rx_deliver(struct efx_channel *channel, u8 *eh,
 		efx_free_rx_buffers(rx_queue, rx_buf, n_frags);
 		return;
 	}
-	lg = &(skb->log);
-	if (log) {
-		lg->log_mark = 1;
-		lg->log_id = log_id++;
-		tsclog_2(ukl_tsc_log, lg->log_id, 100);
-	}
-	
 	skb_record_rx_queue(skb, channel->rx_queue.core_index);
 
 	/* Set the SKB flags */

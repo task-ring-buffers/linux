@@ -60,53 +60,6 @@
 #include "en/params.h"
 #include "devlink.h"
 #include "en/devlink.h"
-#include <linux/tsc_logger.h>
-#include <linux/if_ether.h>
-#include <linux/netdevice.h>
-#include <linux/printk.h>
-#include <linux/highmem.h>
-
-uint64_t log_id_exp1 = 1;
-extern struct TscLog *ukl_tsc_log;
-
-int mlx_tsclog_port_check(struct page *page, u32 offset, u16 rx_headroom, int proto, u32 port)
-{
-	void *packet_data = page_address(page) + offset + rx_headroom;
-	struct ethhdr *eth = (struct ethhdr *) packet_data;
-	struct iphdr *ip;
-	struct udphdr *udp;
-	struct tcphdr *tcp;
-	u16 dport;
-	if(eth->h_proto == htons(ETH_P_IP)) {
-		ip = (struct iphdr *) (eth + 1);
-		if (ip->protocol == proto){
-			if (proto == IPPROTO_UDP) {
-				udp = (struct udphdr *) ((char *)ip + (ip->ihl *4));
-				dport = ntohs(udp->dest);
-				if (dport == port)
-					return 1;
-				else
-					return 0;
-			}
-			else if (proto == IPPROTO_TCP) {
-				tcp = (struct tcphdr *) ((char *)ip + (ip->ihl *4));
-                                dport = ntohs(tcp->dest);
-                                if (dport == port)
-                                        return 1;
-                                else
-                                        return 0;
-
-			}
-		}
-		else {
-			return 0;
-		}
-
-	}
-	return 0;
-
-}
-
 static struct sk_buff *
 mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 				struct mlx5_cqe64 *cqe, u16 cqe_bcnt, u32 head_offset,
@@ -2220,9 +2173,6 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 	void *va, *data;
 	dma_addr_t addr;
 	u32 frag_size;
-	struct log_info *lg;
-	int log;
-
 	/* Check packet size. Note LRO doesn't use linear SKB */
 	if (unlikely(cqe_bcnt > rq->hw_mtu)) {
 		rq->stats->oversize_pkts_sw_drop++;
@@ -2256,18 +2206,9 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 		cqe_bcnt = mxbuf.xdp.data_end - mxbuf.xdp.data;
 	}
 	frag_size = MLX5_SKB_FRAG_SZ(rx_headroom + cqe_bcnt);
-	log = mlx_tsclog_port_check(frag_page->page, head_offset, rx_headroom, IPPROTO_UDP, 8080);
 	skb = mlx5e_build_linear_skb(rq, va, frag_size, rx_headroom, cqe_bcnt, metasize);
 	if (unlikely(!skb))
 		return NULL;
-
-	lg = &(skb->log);
-	if (log) {
-		/* printk("log 200 found and rqn is %u", rq->rqn); */
-		lg->log_mark = 1;
-		lg->log_id = log_id_exp1++;
-		tsclog_2(ukl_tsc_log, lg->log_id, 100);
-	}
 
 	/* queue up for recycling/reuse */
 	skb_mark_for_recycle(skb);

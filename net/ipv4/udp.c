@@ -116,13 +116,9 @@
 #include <net/udp_tunnel.h>
 #include <net/gro.h>
 #include <net/inet_dscp.h>
-#include <linux/tsc_logger.h>
 #if IS_ENABLED(CONFIG_IPV6)
 #include <net/ipv6_stubs.h>
 #endif
-
-
-extern struct TscLog *ukl_tsc_log;
 
 struct udp_table udp_table __read_mostly;
 EXPORT_SYMBOL(udp_table);
@@ -1522,8 +1518,6 @@ int __udp_enqueue_schedule_skb(struct sock *sk, struct sk_buff *skb)
 	spinlock_t *busy = NULL;
 	bool becomes_readable;
 	int size, rcvbuf;
-	struct log_info *lg = &(skb->log);
-
 	/* Immediately drop when the receive queue is full.
 	 * Always allow at least one packet.
 	 */
@@ -1565,9 +1559,6 @@ int __udp_enqueue_schedule_skb(struct sock *sk, struct sk_buff *skb)
 	becomes_readable = skb_queue_empty(list);
 	__skb_queue_tail(list, skb);
 	spin_unlock(&list->lock);
-	if (lg->log_mark)
-		tsclog_2(ukl_tsc_log, lg->log_id, 400);
-
 	if (!sock_flag(sk, SOCK_DEAD)) {
 		if (becomes_readable ||
 		    sk->sk_data_ready != sock_def_readable ||
@@ -1830,8 +1821,6 @@ int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 	int off, err, peeking = flags & MSG_PEEK;
 	int is_udplite = IS_UDPLITE(sk);
 	bool checksum_valid = false;
-	struct log_info *lg;
-
 	if (flags & MSG_ERRQUEUE)
 		return ip_recv_error(sk, msg, len, addr_len);
 
@@ -1841,7 +1830,6 @@ try_again:
 	if (!skb)
 		return err;
 	
-	lg = &(skb->log);
 	ulen = udp_skb_len(skb);
 	copied = len;
 	if (copied > ulen - off)
@@ -1863,24 +1851,16 @@ try_again:
 			goto csum_copy_err;
 	}
 	
-	if (lg->log_mark)
-		tsclog_2(ukl_tsc_log, lg->log_id, 600);
 	if (checksum_valid || udp_skb_csum_unnecessary(skb)) {
 		if (udp_skb_is_linear(skb))
 			err = copy_linear_skb(skb, copied, off, &msg->msg_iter);
 		else
 			err = skb_copy_datagram_msg(skb, off, msg, copied);
-
-		if (lg->log_mark)
-			tsclog_2(ukl_tsc_log, lg->log_id, 602);
-
 	} else {
 		err = skb_copy_and_csum_datagram_msg(skb, off, msg);
 
 		if (err == -EINVAL)
 			goto csum_copy_err;
-		if (lg->log_mark)
-                        tsclog_2(ukl_tsc_log, lg->log_id, 602);
 	}
 
 	if (unlikely(err)) {
@@ -2412,8 +2392,6 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 	struct net *net = dev_net(skb->dev);
 	bool refcounted;
 	int drop_reason;
-	struct log_info *lg = &(skb->log);
-
 	drop_reason = SKB_DROP_REASON_NOT_SPECIFIED;
 
 	/*
@@ -2440,9 +2418,6 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 	if (udp4_csum_init(skb, uh, proto))
 		goto csum_error;
 	
-	if (lg->log_mark)
-		tsclog_2(ukl_tsc_log, lg->log_id, 300);
-
 	sk = inet_steal_sock(net, skb, sizeof(struct udphdr), saddr, uh->source, daddr, uh->dest,
 			     &refcounted, udp_ehashfn);
 	if (IS_ERR(sk))
@@ -2451,9 +2426,6 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 	if (sk) {
 		struct dst_entry *dst = skb_dst(skb);
 		int ret;
-
-		if (lg->log_mark)
-                tsclog_2(ukl_tsc_log, lg->log_id, 301);
 
 		if (unlikely(rcu_dereference(sk->sk_rx_dst) != dst))
 			udp_sk_rx_dst_set(sk, dst);
@@ -2469,9 +2441,6 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 						saddr, daddr, udptable, proto);
 
 	sk = __udp4_lib_lookup_skb(skb, uh->source, uh->dest, udptable);
-
-	if (lg->log_mark)
-                tsclog_2(ukl_tsc_log, lg->log_id, 302);
 
 	if (sk)
 		return udp_unicast_rcv_skb(sk, skb, uh);
