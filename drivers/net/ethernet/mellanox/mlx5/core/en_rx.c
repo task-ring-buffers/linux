@@ -30,9 +30,11 @@
  * SOFTWARE.
  */
 
+#include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/tcp.h>
+#include <linux/tsc_logger.h>
 #include <linux/bitmap.h>
 #include <linux/filter.h>
 #include <net/ip6_checksum.h>
@@ -60,6 +62,55 @@
 #include "en/params.h"
 #include "devlink.h"
 #include "en/devlink.h"
+
+extern struct TscLog *ukl_tsc_log;
+
+static void mlx5e_log_tcpcl_reqid(const void *packet_data, u32 packet_len)
+{
+	const struct ethhdr *eth = packet_data;
+	const struct iphdr *ip;
+	const struct tcphdr *tcp;
+	const u8 *payload;
+	u32 l2_len = sizeof(*eth);
+	u32 l3_len;
+	u32 l4_len;
+	u32 request_id = 0;
+
+	if (!ukl_tsc_log || packet_len < l2_len)
+		return;
+
+	if (eth->h_proto != htons(ETH_P_IP))
+		return;
+
+	if (packet_len < l2_len + sizeof(*ip))
+		return;
+
+	ip = (const struct iphdr *)((const u8 *)packet_data + l2_len);
+	if (ip->protocol != IPPROTO_TCP)
+		return;
+
+	l3_len = ip->ihl * 4;
+	if (l3_len < sizeof(*ip) ||
+	    packet_len < l2_len + l3_len + sizeof(*tcp))
+		return;
+
+	tcp = (const struct tcphdr *)((const u8 *)ip + l3_len);
+	if (ntohs(tcp->dest) != 8080)
+		return;
+
+	l4_len = tcp->doff * 4;
+	if (l4_len < sizeof(*tcp) ||
+	    packet_len < l2_len + l3_len + l4_len + 8)
+		return;
+
+	payload = (const u8 *)tcp + l4_len;
+	if (memcmp(payload, "DEAD", 4) != 0)
+		return;
+
+	memcpy(&request_id, payload + 4, sizeof(request_id));
+	if (request_id)
+		tsclog_2(ukl_tsc_log, request_id, 1000);
+}
 static struct sk_buff *
 mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 				struct mlx5_cqe64 *cqe, u16 cqe_bcnt, u32 head_offset,
@@ -2205,6 +2256,7 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 		metasize = mxbuf.xdp.data - mxbuf.xdp.data_meta;
 		cqe_bcnt = mxbuf.xdp.data_end - mxbuf.xdp.data;
 	}
+	mlx5e_log_tcpcl_reqid(va + rx_headroom, cqe_bcnt);
 	frag_size = MLX5_SKB_FRAG_SZ(rx_headroom + cqe_bcnt);
 	skb = mlx5e_build_linear_skb(rq, va, frag_size, rx_headroom, cqe_bcnt, metasize);
 	if (unlikely(!skb))
