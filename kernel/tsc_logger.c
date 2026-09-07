@@ -16,7 +16,7 @@ static void *allocated;
 struct TscLog *ukl_tsc_log;
 EXPORT_SYMBOL_GPL(ukl_tsc_log);
 
-static int max_event_count = 1000000;
+static int max_event_count = 10000000;
 module_param(max_event_count, int, 0);
 
 static int vals_per_entry = 2;
@@ -101,4 +101,3 @@ static void __exit cleanup_tsc_logger(void)
 
 module_init(setup_tsc_logger);
 module_exit(cleanup_tsc_logger);
-
