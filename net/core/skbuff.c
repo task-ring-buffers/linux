@@ -1050,6 +1050,9 @@ static bool skb_trb_pp_put_page(struct queue_ctx *qctx, struct page *page, u32 p
 	struct page_pool *pool;
 	long ret;
 
+	if (unlikely(!qctx))
+		return false;
+
 	if (unlikely(!is_pp_netmem(netmem)))
 		return false;
 
@@ -1235,12 +1238,6 @@ void skb_release_head_state(struct sk_buff *skb)
 /* Free everything but the sk_buff shell. */
 static void skb_release_all(struct sk_buff *skb, enum skb_drop_reason reason)
 {
-#ifdef CONFIG_TRB_RX_RING_DEV
-	if (skb->trb_pkt)
-		/* pr_warn("TRB skb free: skb=%px users=%d active_ext=%u ext=%px trb_pkt=%u trb_head_ix=%u\n",
-			skb, refcount_read(&skb->users), skb->active_extensions,
-			skb->extensions, skb->trb_pkt, skb->trb_head_page_ix); */
-#endif
 	skb_release_head_state(skb);
 	if (likely(skb->head))
 		skb_release_data(skb, reason);
@@ -1595,6 +1592,12 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
 	 * It is not yet because we do not want to have a 16 bit hole
 	 */
 	new->queue_mapping = old->queue_mapping;
+
+#ifdef CONFIG_TRB_RX_RING_DEV
+	new->trb_pkt = old->trb_pkt;
+	new->trb_head_page_ix = old->trb_head_page_ix;
+	new->trb_qctx = old->trb_qctx;
+#endif
 
 	memcpy(&new->headers, &old->headers, sizeof(new->headers));
 	CHECK_SKB_FIELD(protocol);
@@ -6081,6 +6084,11 @@ bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
 	if (to->pp_recycle != from->pp_recycle)
 		return false;
 
+#ifdef CONFIG_TRB_RX_RING_DEV
+	if (to->trb_pkt != from->trb_pkt)
+		return false;
+#endif
+
 	if (skb_frags_readable(from) != skb_frags_readable(to))
 		return false;
 
@@ -6118,7 +6126,8 @@ bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
 				   page, offset, skb_headlen(from));
 #ifdef CONFIG_TRB_RX_RING_DEV
         /* pr_warn("Coalescing trb_idx %u \n", from->trb_head_page_ix); */
-		to_shinfo->trb_page_ix[to_shinfo->nr_frags] = from->trb_head_page_ix;
+		if (from->trb_pkt)
+			to_shinfo->trb_page_ix[to_shinfo->nr_frags] = from->trb_head_page_ix;
 #endif
 		*fragstolen = true;
 	} else {
@@ -6135,9 +6144,10 @@ bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
 	       from_shinfo->frags,
 	       from_shinfo->nr_frags * sizeof(skb_frag_t));
 #ifdef CONFIG_TRB_RX_RING_DEV
-	memcpy(to_shinfo->trb_page_ix + to_shinfo->nr_frags,
-	       from_shinfo->trb_page_ix,
-	       from_shinfo->nr_frags * sizeof(to_shinfo->trb_page_ix[0]));
+	if (from->trb_pkt)
+		memcpy(to_shinfo->trb_page_ix + to_shinfo->nr_frags,
+		       from_shinfo->trb_page_ix,
+		       from_shinfo->nr_frags * sizeof(to_shinfo->trb_page_ix[0]));
 #endif
 	to_shinfo->nr_frags += from_shinfo->nr_frags;
 
