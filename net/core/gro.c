@@ -112,6 +112,11 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
 	if (p->pp_recycle != skb->pp_recycle)
 		return -ETOOMANYREFS;
 
+#ifdef CONFIG_TRB_RX_RING_DEV
+	if (p->trb_pkt != skb->trb_pkt)
+		return -ETOOMANYREFS;
+#endif
+
 	if (unlikely(p->len + len >= netif_get_gro_max_size(p->dev, p) ||
 		     NAPI_GRO_CB(skb)->flush))
 		return -E2BIG;
@@ -148,13 +153,16 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
 		frag = pinfo->frags + nr_frags;
 		frag2 = skbinfo->frags + i;
 #ifdef CONFIG_TRB_RX_RING_DEV
-		page_ix = pinfo->trb_page_ix + nr_frags;
-		page_ix2 = skbinfo->trb_page_ix + i;
+		if (skb->trb_pkt) {
+			page_ix = pinfo->trb_page_ix + nr_frags;
+			page_ix2 = skbinfo->trb_page_ix + i;
+		}
 #endif
 		do {
 			*--frag = *--frag2;
 #ifdef CONFIG_TRB_RX_RING_DEV
-			*--page_ix = *--page_ix2;
+			if (skb->trb_pkt)
+				*--page_ix = *--page_ix2;
 #endif
 		} while (--i);
 
@@ -189,14 +197,16 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
 
 		skb_frag_fill_page_desc(frag, page, first_offset, first_size);
 #ifdef CONFIG_TRB_RX_RING_DEV
-		pinfo->trb_page_ix[nr_frags] = skb->trb_head_page_ix;
+		if (skb->trb_pkt)
+			pinfo->trb_page_ix[nr_frags] = skb->trb_head_page_ix;
 #endif
 
 		memcpy(frag + 1, skbinfo->frags, sizeof(*frag) * skbinfo->nr_frags);
 #ifdef CONFIG_TRB_RX_RING_DEV
-		memcpy(pinfo->trb_page_ix + nr_frags + 1,
-		       skbinfo->trb_page_ix,
-		       skbinfo->nr_frags * sizeof(pinfo->trb_page_ix[0]));
+		if (skb->trb_pkt)
+			memcpy(pinfo->trb_page_ix + nr_frags + 1,
+			       skbinfo->trb_page_ix,
+			       skbinfo->nr_frags * sizeof(pinfo->trb_page_ix[0]));
 #endif
 		/* We dont need to clear skbinfo->nr_frags here */
 

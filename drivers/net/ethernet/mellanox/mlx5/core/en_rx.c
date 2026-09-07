@@ -278,7 +278,8 @@ static int mlx5e_page_alloc_fragmented(struct mlx5e_rq *rq,
 {
 	struct page *page;
 	u32 trb_page_ix = 0;
-	if (rq->priv->channels.params.trb_enabled && rq->ix != 0) {
+	if (rq->priv->channels.params.trb_enabled && rq->ix != 0 &&
+	    rq->trb_qctx) {
 #if 0
 		pr_warn("TRB page is allocated: rq_ix: %d \n", rq->ix);
 #endif
@@ -303,7 +304,8 @@ static int mlx5e_page_alloc_fragmented(struct mlx5e_rq *rq,
 #endif
 	};
 #ifdef CONFIG_TRB_RX_RING_DEV
-	if (rq->priv->channels.params.trb_enabled && rq->ix != 0) {
+	if (rq->priv->channels.params.trb_enabled && rq->ix != 0 &&
+	    rq->trb_qctx) {
 #if 0
 		pr_warn("TRB frag_page->trb_page_ix=%u rq_ix=%d page=%px\n",
 			frag_page->trb_page_ix, rq->ix, frag_page->page);
@@ -322,7 +324,8 @@ static void mlx5e_page_release_fragmented(struct mlx5e_rq *rq,
 
 	if (page_pool_unref_page(page, drain_count) == 0) {
 #ifdef CONFIG_TRB_RX_RING_DEV
-		if (rq->priv->channels.params.trb_enabled && rq->ix != 0) {
+		if (rq->priv->channels.params.trb_enabled && rq->ix != 0 &&
+		    rq->trb_qctx) {
 			if (trb_free_ring_return_ctx(rq->trb_qctx, page,
 						     frag_page->trb_page_ix))
 				page_pool_put_unrefed_page(rq->page_pool, page, -1, true);
@@ -1663,8 +1666,9 @@ static inline void mlx5e_complete_rx_cqe(struct mlx5e_rq *rq,
 	stats->bytes += cqe_bcnt;
 	mlx5e_build_rx_skb(cqe, cqe_bcnt, rq, skb);
 #ifdef CONFIG_TRB_RX_RING_DEV
-	skb->trb_pkt = rq->priv->channels.params.trb_enabled && rq->ix != 0;
-	skb->trb_qctx = rq->trb_qctx;
+	skb->trb_pkt = rq->priv->channels.params.trb_enabled &&
+		       rq->ix != 0 && rq->trb_qctx;
+	skb->trb_qctx = skb->trb_pkt ? rq->trb_qctx : NULL;
 #endif
 }
 
@@ -2213,11 +2217,12 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 	/* queue up for recycling/reuse */
 	skb_mark_for_recycle(skb);
 #ifdef CONFIG_TRB_RX_RING_DEV
-	if (rq->priv->channels.params.trb_enabled && rq->ix != 0)
+	if (rq->priv->channels.params.trb_enabled && rq->ix != 0 &&
+	    rq->trb_qctx)
 		/* pr_warn("TRB pre-set head idx: skb=%px active_ext=%u ext=%px trb_pkt=%u trb_head_ix=%u\n",
 			skb, skb->active_extensions, skb->extensions,
 			skb->trb_pkt, skb->trb_head_page_ix); */
-	skb->trb_head_page_ix = frag_page->trb_page_ix;
+		skb->trb_head_page_ix = frag_page->trb_page_ix;
 #endif
 	frag_page->frags++;
 

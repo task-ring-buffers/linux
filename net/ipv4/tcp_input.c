@@ -4965,17 +4965,13 @@ static void tcp_ofo_queue(struct sock *sk)
 		tcp_rcv_nxt_update(tp, TCP_SKB_CB(skb)->end_seq);
 		fin = TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN;
 		if (!eaten) {
-			if (skb->trb_pkt)
-				/* pr_warn("TRB ofo enqueue: conn_id=%llu skb=%px seq=%u end_seq=%u len=%u trb_pkt=%u head_ix=%u\n",
-					READ_ONCE(sk->sk_trb_sock_id), skb,
-					TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq,
-					skb->len, skb->trb_pkt, skb->trb_head_page_ix); */
 			__skb_queue_tail(&sk->sk_receive_queue, skb);
 		} else
 			kfree_skb_partial(skb, fragstolen);
 
 #ifdef CONFIG_TRB_RX_RING_DEV
-		if (skb->trb_pkt && !eaten) {
+		if (READ_ONCE(skb->trb_pkt) && READ_ONCE(skb->trb_qctx) &&
+		    !eaten) {
 			int trb_ret = trb_tcp_queue_skb(skb->trb_qctx, sk, skb);
 
 			if (trb_ret)
@@ -5182,11 +5178,6 @@ static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb,
 	}
 	tcp_rcv_nxt_update(tcp_sk(sk), TCP_SKB_CB(skb)->end_seq);
 	if (!eaten) {
-		if (skb->trb_pkt)
-			/* pr_warn("TRB queue_rcv enqueue: conn_id=%llu skb=%px seq=%u end_seq=%u len=%u trb_pkt=%u head_ix=%u\n",
-				trb_sock_id, skb, TCP_SKB_CB(skb)->seq,
-				TCP_SKB_CB(skb)->end_seq, skb->len,
-				skb->trb_pkt, skb->trb_head_page_ix); */
 		__skb_queue_tail(&sk->sk_receive_queue, skb);
 		skb_set_owner_r(skb, sk);
 	}
@@ -5258,7 +5249,7 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 	bool fragstolen;
 	int eaten;
 #ifdef CONFIG_TRB_RX_RING_DEV
-	bool trb_pkt = READ_ONCE(skb->trb_pkt);
+	bool trb_pkt = READ_ONCE(skb->trb_pkt) && READ_ONCE(skb->trb_qctx);
 #endif
 
 	/* If a subflow has been reset, the packet should not continue
@@ -5318,10 +5309,6 @@ queue_and_out:
 		}
 
 		eaten = tcp_queue_rcv(sk, skb, &fragstolen);
-		if (trb_pkt && eaten > 0)
-			/* pr_warn("TRB skb eaten before queue: skb=%px qctx=%px seq=%u end_seq=%u len=%u\n",
-				skb, skb->trb_qctx, TCP_SKB_CB(skb)->seq,
-				TCP_SKB_CB(skb)->end_seq, skb->len); */
 		if (skb->len)
 			tcp_event_data_recv(sk, skb);
 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
@@ -6245,7 +6232,8 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 			int eaten = 0;
 			bool fragstolen = false;
 #ifdef CONFIG_TRB_RX_RING_DEV
-			bool trb_pkt = READ_ONCE(skb->trb_pkt);
+			bool trb_pkt = READ_ONCE(skb->trb_pkt) &&
+				       READ_ONCE(skb->trb_qctx);
 #endif
 
 			if (tcp_checksum_complete(skb))
