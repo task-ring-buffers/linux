@@ -2174,6 +2174,7 @@ mlx5e_skb_from_cqe_mpwrq_nonlinear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *w
 		skb->len  += headlen;
 	}
 
+	mlx5e_log_tcpcl_reqid(skb->data, skb_headlen(skb));
 	return skb;
 }
 
@@ -2223,6 +2224,7 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 		metasize = mxbuf.xdp.data - mxbuf.xdp.data_meta;
 		cqe_bcnt = mxbuf.xdp.data_end - mxbuf.xdp.data;
 	}
+	mlx5e_log_tcpcl_reqid(va + rx_headroom, cqe_bcnt);
 	frag_size = MLX5_SKB_FRAG_SZ(rx_headroom + cqe_bcnt);
 	skb = mlx5e_build_linear_skb(rq, va, frag_size, rx_headroom, cqe_bcnt, metasize);
 	if (unlikely(!skb))
