@@ -101,8 +101,6 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
 	unsigned int new_truesize;
 	struct sk_buff *lp;
 	int segs;
-    
-    pr_warn("TRB debug: skb_gro_receive called\n");
 	/* Do not splice page pool based packets w/ non-page pool
 	 * packets. This can result in reference count issues as page
 	 * pool pages will not decrement the reference count and will
