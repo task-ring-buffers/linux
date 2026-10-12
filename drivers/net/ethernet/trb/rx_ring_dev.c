@@ -29,9 +29,9 @@
 #define DEV_NAME "trb_dev"
 
 /* Ring capacity must be powers of two for mask-based indexing */
-#define DESC_CAP 64     /* kernel -> user descriptors */
+#define DESC_CAP 1024   /* kernel -> user descriptors */
 /* Ring capacity must stay power-of-two because rr_pop/rr_push use mask indexing. */
-#define FILL_CAP 512    /* user -> kernel buf_id ring */
+#define FILL_CAP 1024   /* user -> kernel buf_id ring */
 
 /* Switch to pp_frag for sub_page buffers */
 #define BUF_SIZE PAGE_SIZE
