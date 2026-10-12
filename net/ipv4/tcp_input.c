@@ -6278,11 +6278,19 @@ no_ack:
 				kfree_skb_partial(skb, fragstolen);
 #ifdef CONFIG_TRB_RX_RING_DEV
 			if (trb_pkt && !eaten) {
+				int trb_ret = trb_tcp_queue_skb(skb->trb_qctx, sk, skb);
+
 				/* pr_warn("TCP fast path about to call TRB hook: conn_id=%llu skb=%px seq=%u end_seq=%u len=%u trb_pkt=%u head_ix=%u\n",
 					READ_ONCE(sk->sk_trb_sock_id), skb,
 					TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq,
 					skb->len, skb->trb_pkt, skb->trb_head_page_ix); */
-				if (!trb_tcp_queue_skb(skb->trb_qctx, sk, skb))
+				if (trb_ret)
+					pr_warn("TRB fast queue call failed: skb=%px ret=%d eaten=%d seq=%u end_seq=%u len=%u trb_pkt=%u head_ix=%u\n",
+						skb, trb_ret, eaten, TCP_SKB_CB(skb)->seq,
+						TCP_SKB_CB(skb)->end_seq, skb->len,
+						skb->trb_pkt, skb->trb_head_page_ix);
+
+				if (!trb_ret)
 					return;
 			}
 #endif
